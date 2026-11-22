@@ -47,11 +47,10 @@ def _load_slide_thumbnail(
 
 
 def estimate_tsr_color_heuristic(rgb: np.ndarray, bg_thresh: int = 225) -> float:
-    """Estimate stromal ratio inside non-white tissue regions using H&E color separation.
+    """Estimate stromal ratio inside non-white tissue regions via H&E optical-density separation.
 
-    - Glass background: min(R,G,B) > bg_thresh or luminance > bg_thresh
-    - Stroma (eosin-rich): pink/red-shifted (R - B > 15 and brightness > 135)
-    - Tumor nuclei (hematoxylin-rich): blue/purple-shifted or dark dense nuclei
+    Uses the Ruifrok & Johnston (2001) H&E stain deconvolution matrix so eosin-rich fibrous
+    stroma is separated from hematoxylin-rich tumor nuclei and pink hepatocyte cytoplasm.
     """
     rgb_f = rgb.astype(np.float32)
     r, g, b = rgb_f[..., 0], rgb_f[..., 1], rgb_f[..., 2]
@@ -63,10 +62,25 @@ def estimate_tsr_color_heuristic(rgb: np.ndarray, bg_thresh: int = 225) -> float
     if n_tissue < 20:
         return 0.18
 
-    # Eosin-rich stromal collagen/fibrosis appears brighter pink (R > B > G)
-    stroma_mask = tissue_mask & ((r - g) > 20.0) & (r > b) & (gray > 120.0)
+    od = -np.log10(np.clip(rgb_f, 1.0, 255.0) / 255.0)
+    # Ruifrok & Johnston (2001) standard H&E stain matrix rows: [Hematoxylin, Eosin, Residual]
+    he_matrix = np.array(
+        [
+            [0.650, 0.704, 0.286],
+            [0.072, 0.990, 0.105],
+            [0.268, 0.570, 0.776],
+        ],
+        dtype=np.float32,
+    )
+    he_inv = np.linalg.inv(he_matrix)
+    stains = od @ he_inv
+    hematoxylin = stains[..., 0]
+    eosin = stains[..., 1]
+
+    # Fibrous/collagenous stroma: clear eosin signal with low hematoxylin (sparse nuclei)
+    stroma_mask = tissue_mask & (eosin > 0.06) & (hematoxylin < 0.06) & ((eosin - hematoxylin) > 0.07)
     raw_ratio = float(stroma_mask.sum()) / float(n_tissue)
-    return float(np.clip(raw_ratio, 0.02, 0.70))
+    return float(np.clip(raw_ratio, 0.02, 0.95))
 
 
 def estimate_tsr_tiatoolbox(slide_path: Path) -> float:

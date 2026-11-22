@@ -228,35 +228,47 @@ def plot_rcs_tsr_curve(oof_df: pd.DataFrame, knots_pct: list[float], report_dir:
         .dropna()
     )
     tsr_vals = pat["pTSR"].to_numpy(dtype=np.float64)
-    if np.std(tsr_vals) < 1e-5:
+    if len(tsr_vals) < 10 or (float(np.max(tsr_vals)) - float(np.min(tsr_vals))) < 1e-4 or np.std(tsr_vals) < 1e-5:
+        print("[Stage 4][WARN] Degenerate pTSR spread; skipping RCS curve.")
         return
 
-    knots = np.quantile(tsr_vals, [p / 100.0 for p in knots_pct])
+    knots = np.unique(np.quantile(tsr_vals, [p / 100.0 for p in knots_pct]))
+    if len(knots) < 3:
+        knots = np.linspace(float(np.min(tsr_vals)), float(np.max(tsr_vals)), num=4)
     lower, upper = float(knots[0]), float(knots[-1])
-    inner = [float(k) for k in knots[1:-1]]
+    inner = [float(k) for k in knots[1:-1] if lower < float(k) < upper]
+    if not inner:
+        inner = [float(0.5 * (lower + upper))]
 
-    formula = (
-        f"cr(pTSR, knots={inner}, lower_bound={lower}, upper_bound={upper}) - 1"
-    )
-    basis = np.asarray(dmatrix(formula, {"pTSR": tsr_vals}))
-    rcs_cols = [f"rcs_{i}" for i in range(basis.shape[1])]
-    fit_df = pd.DataFrame(basis, columns=rcs_cols)
-    fit_df["os_time"] = pat["os_time"].to_numpy()
-    fit_df["os_event"] = pat["os_event"].to_numpy()
+    try:
+        formula = (
+            f"cr(pTSR, knots={inner}, lower_bound={lower}, upper_bound={upper}) - 1"
+        )
+        basis = np.asarray(dmatrix(formula, {"pTSR": tsr_vals}))
+        rcs_cols = [f"rcs_{i}" for i in range(basis.shape[1])]
+        fit_df = pd.DataFrame(basis, columns=rcs_cols)
+        fit_df["os_time"] = pat["os_time"].to_numpy()
+        fit_df["os_event"] = pat["os_event"].to_numpy()
 
-    cph = CoxPHFitter(penalizer=0.1)
-    cph.fit(fit_df, duration_col="os_time", event_col="os_event")
+        cph = CoxPHFitter(penalizer=0.1)
+        cph.fit(fit_df, duration_col="os_time", event_col="os_event")
 
-    grid_tsr = np.linspace(float(np.quantile(tsr_vals, 0.03)), float(np.quantile(tsr_vals, 0.97)), 120)
-    grid_basis = np.asarray(dmatrix(formula, {"pTSR": grid_tsr}))
-    ref_tsr = float(np.median(tsr_vals))
-    ref_basis = np.asarray(dmatrix(formula, {"pTSR": np.array([ref_tsr])}))
-    diff_basis = grid_basis - ref_basis
+        q_lo, q_hi = float(np.quantile(tsr_vals, 0.03)), float(np.quantile(tsr_vals, 0.97))
+        if q_hi <= q_lo:
+            q_lo, q_hi = lower, upper
+        grid_tsr = np.linspace(q_lo, q_hi, 120)
+        grid_basis = np.asarray(dmatrix(formula, {"pTSR": grid_tsr}))
+        ref_tsr = float(np.clip(np.median(tsr_vals), lower, upper))
+        ref_basis = np.asarray(dmatrix(formula, {"pTSR": np.array([ref_tsr])}))
+        diff_basis = grid_basis - ref_basis
 
-    beta = cph.params_.to_numpy()
-    cov = cph.variance_matrix_.to_numpy()
-    log_hr = diff_basis @ beta
-    se = np.sqrt(np.maximum(np.einsum("ij,jk,ik->i", diff_basis, cov, diff_basis), 1e-12))
+        beta = cph.params_.to_numpy()
+        cov = cph.variance_matrix_.to_numpy()
+        log_hr = diff_basis @ beta
+        se = np.sqrt(np.maximum(np.einsum("ij,jk,ik->i", diff_basis, cov, diff_basis), 1e-12))
+    except Exception as exc:
+        print(f"[Stage 4][WARN] Failed to fit RCS Cox curve ({exc}); skipping rcs_tsr_curve.png.")
+        return
     hr = np.exp(log_hr)
     hr_lo = np.exp(log_hr - 1.96 * se)
     hr_hi = np.exp(log_hr + 1.96 * se)

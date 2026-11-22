@@ -28,7 +28,12 @@ from torch.utils.data import DataLoader
 DIR1_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(DIR1_ROOT / "src"))
 
-from direction1.dataset import PatientMILDataset
+from direction1.dataset import (
+    PatientMILDataset,
+    build_h5_index,
+    is_valid_trident_h5,
+    resolve_h5_from_index,
+)
 from direction1.losses import NLLSurvLoss, fit_survival_bins, transform_survival_bins
 from direction1.models import GatedABMIL, TokenGuidedMultimodalSurv
 from direction1.utils import assert_no_patient_leakage, load_yaml_config, resolve_path
@@ -365,6 +370,35 @@ def main() -> None:
     device = _select_device()
     print(f"[Stage 3B] Device: {device} | Seeds: {seeds} | Clinical cols: {clinical_cols}")
 
+    exact_h5, prefix_h5 = build_h5_index(feats_dir)
+    valid_mask: list[bool] = []
+    missing_slides: list[str] = []
+    for sid in merged["slide_id"].astype(str):
+        h5_path = resolve_h5_from_index(exact_h5, prefix_h5, sid)
+        if h5_path is not None and is_valid_trident_h5(h5_path):
+            valid_mask.append(True)
+        else:
+            valid_mask.append(False)
+            missing_slides.append(sid)
+
+    n_total_slides = len(merged)
+    n_valid_slides = sum(valid_mask)
+    if n_valid_slides == 0:
+        sample_found = list(exact_h5.keys())[:5]
+        sample_expected = merged["slide_id"].astype(str).tolist()[:5]
+        raise FileNotFoundError(
+            f"No valid TRIDENT .h5 features found under {feats_dir} "
+            f"(discovered {len(exact_h5)} .h5 files, sample stems={sample_found}; "
+            f"expected slide_ids={sample_expected})."
+        )
+    if missing_slides:
+        merged = merged[valid_mask].reset_index(drop=True)
+        print(
+            f"[Stage 3B][WARN] Skipping {len(missing_slides)}/{n_total_slides} slides without valid TRIDENT .h5 "
+            f"features under {feats_dir} (e.g. {missing_slides[:5]}). "
+            f"Proceeding with {merged['patient_id'].nunique()} aligned patients ({len(merged)} slides)."
+        )
+
     all_metrics: list[dict[str, Any]] = []
     all_oofs: list[pd.DataFrame] = []
 
@@ -446,6 +480,7 @@ def main() -> None:
                 max_patches=max_patches_train,
                 training=True,
                 seed=seed + fold,
+                h5_index=(exact_h5, prefix_h5),
             )
             val_ds = PatientMILDataset(
                 va_slides,
@@ -455,6 +490,7 @@ def main() -> None:
                 max_patches=max_patches_eval,
                 training=False,
                 seed=seed + fold,
+                h5_index=(exact_h5, prefix_h5),
             )
 
             for exp_name in dl_exps:

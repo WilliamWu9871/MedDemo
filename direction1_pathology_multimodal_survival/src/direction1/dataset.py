@@ -29,6 +29,45 @@ def _load_trident_h5(h5_path: Path) -> tuple[np.ndarray, np.ndarray]:
     return np.asarray(feats, dtype=np.float32), np.asarray(coords, dtype=np.int64)
 
 
+def build_h5_index(feats_dir: str | Path) -> tuple[dict[str, Path], dict[str, Path]]:
+    """Index TRIDENT .h5 files by exact stem and unambiguous TCGA slide prefix."""
+    root = Path(feats_dir)
+    if not root.exists():
+        return {}, {}
+    exact_map: dict[str, Path] = {}
+    prefix_buckets: dict[str, list[Path]] = {}
+    for h5_path in sorted(root.rglob("*.h5")):
+        exact_map[h5_path.stem] = h5_path
+        prefix = h5_path.stem.split(".")[0]
+        prefix_buckets.setdefault(prefix, []).append(h5_path)
+    prefix_map = {prefix: paths[0] for prefix, paths in prefix_buckets.items() if len(paths) == 1}
+    return exact_map, prefix_map
+
+
+def resolve_h5_from_index(
+    exact_map: dict[str, Path],
+    prefix_map: dict[str, Path],
+    slide_id: str,
+) -> Path | None:
+    """Resolve a slide_id to a TRIDENT .h5 path via exact stem or unique TCGA prefix."""
+    if slide_id in exact_map:
+        return exact_map[slide_id]
+    return prefix_map.get(slide_id.split(".")[0])
+
+
+def is_valid_trident_h5(h5_path: Path) -> bool:
+    """Return True if h5_path is readable and contains a non-empty 2D feature matrix."""
+    try:
+        with h5py.File(h5_path, "r") as hf:
+            key = "features" if "features" in hf else ("feats" if "feats" in hf else None)
+            if key is None:
+                return False
+            ds = hf[key]
+            return len(ds.shape) == 2 and ds.shape[0] > 0 and ds.shape[1] > 0
+    except (OSError, KeyError, ValueError):
+        return False
+
+
 class PatientMILDataset(Dataset):
     """Bag dataset grouped by ``patient_id`` to prevent slide-to-patient leakage.
 
@@ -45,6 +84,7 @@ class PatientMILDataset(Dataset):
         max_patches: int | None = None,
         training: bool = True,
         seed: int = 42,
+        h5_index: tuple[dict[str, Path], dict[str, Path]] | None = None,
     ):
         self.feats_dir = Path(feats_dir)
         self.clinical_cols = list(clinical_cols)
@@ -52,6 +92,7 @@ class PatientMILDataset(Dataset):
         self.max_patches = max_patches
         self.training = training
         self.rng = np.random.default_rng(seed)
+        self._exact_h5, self._prefix_h5 = h5_index if h5_index is not None else build_h5_index(self.feats_dir)
 
         self.patients: list[dict[str, Any]] = []
         for patient_id, grp in records_df.groupby("patient_id", sort=False):
@@ -94,12 +135,9 @@ class PatientMILDataset(Dataset):
         self.feature_dim = int(sample_feats.shape[1])
 
     def _resolve_h5(self, slide_id: str) -> Path:
-        direct = self.feats_dir / f"{slide_id}.h5"
-        if direct.exists():
-            return direct
-        matches = list(self.feats_dir.rglob(f"{slide_id}.h5"))
-        if matches:
-            return matches[0]
+        resolved = resolve_h5_from_index(self._exact_h5, self._prefix_h5, slide_id)
+        if resolved is not None:
+            return resolved
         raise FileNotFoundError(f"Could not find feature .h5 for slide_id={slide_id!r} under {self.feats_dir}")
 
     def __len__(self) -> int:
