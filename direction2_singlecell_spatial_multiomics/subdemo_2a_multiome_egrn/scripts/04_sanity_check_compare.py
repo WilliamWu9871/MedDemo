@@ -12,47 +12,169 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import numpy as np
-import pandas as pd
+if TYPE_CHECKING:
+    import numpy as np
+    import pandas as pd
 
 SUB2A_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _resolve_scdori_path(scdori_config_path: Path, raw_path: str) -> Path:
+    """Resolve a path from a scDoRI JSON config the same way scdori.configuration does."""
+    p = Path(raw_path)
+    return p if p.is_absolute() else (scdori_config_path.parent / p).resolve()
+
+
+def _topic_matches_value(val: Any, tid: int) -> bool:
+    """Return True if a raw cell value matches topic ID ``tid`` ('Topic_{tid}' or '{tid}')."""
+    s = str(val).strip()
+    return s == f"Topic_{tid}" or s == str(tid)
+
+
+def extract_topic_tfs(leading_tfs: Any, tid: int, top_n: int) -> list[str]:
+    """Extract top TF symbols for topic ``tid`` from a DataFrame or sequence of dicts."""
+    if hasattr(leading_tfs, "columns"):
+        topic_col = "topic" if "topic" in leading_tfs.columns else leading_tfs.columns[0]
+        tf_col = "tf" if "tf" in leading_tfs.columns else leading_tfs.columns[1]
+        mask = [
+            _topic_matches_value(v, tid)
+            for v in leading_tfs[topic_col].tolist()
+        ]
+        sub = leading_tfs.loc[mask, tf_col].tolist()
+        return [str(t).strip() for t in sub if str(t).strip()][:top_n]
+
+    out: list[str] = []
+    for row in leading_tfs:
+        topic_val = row.get("topic") if "topic" in row else next(iter(row.values()))
+        if _topic_matches_value(topic_val, tid):
+            tf_val = str(row.get("tf", "")).strip()
+            if tf_val:
+                out.append(tf_val)
+                if len(out) >= top_n:
+                    break
+    return out
+
+
+def extract_topic_genes(leading_genes: Any, tid: int, top_n: int) -> list[str]:
+    """Extract top target gene symbols for topic ``tid`` from DataFrame or dict rows.
+
+    Handles both official scDoRI ``downstream.ipynb`` exports (``Topic`` + comma-separated
+    ``Leading genes``) and one-row-per-gene tables (``topic`` + ``gene``).
+    """
+    if hasattr(leading_genes, "columns"):
+        cols = list(leading_genes.columns)
+        if "Topic" in cols and "Leading genes" in cols:
+            genes: list[str] = []
+            for topic_val, cell in zip(
+                leading_genes["Topic"].tolist(),
+                leading_genes["Leading genes"].tolist(),
+            ):
+                if _topic_matches_value(topic_val, tid) and cell is not None:
+                    for g in str(cell).split(","):
+                        g_clean = g.strip()
+                        if g_clean and g_clean.lower() != "nan" and g_clean not in genes:
+                            genes.append(g_clean)
+                            if len(genes) >= top_n:
+                                return genes
+            return genes
+
+        topic_col = "topic" if "topic" in cols else cols[0]
+        gene_col = "gene" if "gene" in cols else cols[1]
+        out: list[str] = []
+        for topic_val, gene_val in zip(
+            leading_genes[topic_col].tolist(),
+            leading_genes[gene_col].tolist(),
+        ):
+            if _topic_matches_value(topic_val, tid):
+                g_clean = str(gene_val).strip()
+                if g_clean and g_clean.lower() != "nan":
+                    out.append(g_clean)
+                    if len(out) >= top_n:
+                        break
+        return out
+
+    genes = []
+    for row in leading_genes:
+        if "Topic" in row and "Leading genes" in row:
+            if _topic_matches_value(row["Topic"], tid) and row["Leading genes"] is not None:
+                for g in str(row["Leading genes"]).split(","):
+                    g_clean = g.strip()
+                    if g_clean and g_clean not in genes:
+                        genes.append(g_clean)
+                        if len(genes) >= top_n:
+                            return genes
+        else:
+            topic_val = row.get("topic") if "topic" in row else next(iter(row.values()))
+            if _topic_matches_value(topic_val, tid):
+                g_clean = str(row.get("gene", "")).strip()
+                if g_clean:
+                    genes.append(g_clean)
+                    if len(genes) >= top_n:
+                        break
+    return genes
 
 
 def _extract_scdori_topics_and_grn(
     scdori_config_path: Path,
     adata_ref,
-) -> tuple[np.ndarray, pd.DataFrame, pd.DataFrame]:
-    """Load cell x Topic matrix and leading TF/target tables from scDoRI outputs/model."""
+) -> tuple[np.ndarray, list[str] | None, pd.DataFrame, pd.DataFrame]:
+    """Load cell x Topic matrix, obs names, and leading TF/target tables from scDoRI outputs/model."""
+    import numpy as np
+    import pandas as pd
+
     with scdori_config_path.open("r", encoding="utf-8") as handle:
         sc_cfg = json.load(handle)
 
-    grn_dir = SUB2A_ROOT / sc_cfg["downstream"]["grn_output"]
-    # 1. Look for exported topic matrix CSV/NPY if saved, otherwise compute via official scDoRI API
+    grn_dir = _resolve_scdori_path(scdori_config_path, sc_cfg["downstream"]["grn_output"])
     topic_mat: np.ndarray | None = None
+    topic_obs_names: list[str] | None = None
+
     for cand in [
+        grn_dir / "matrix_exports" / "cell_topics.csv.gz",
+        grn_dir / "matrix_exports" / "cell_topics.csv",
         grn_dir / "cell_topics.npy",
         grn_dir / "scdori_latent.npy",
-        grn_dir / "matrix_exports" / "cell_topics.csv",
     ]:
         if cand.exists():
             if cand.suffix == ".npy":
                 topic_mat = np.load(cand)
             else:
-                topic_mat = pd.read_csv(cand, index_col=0).to_numpy(dtype=np.float32)
+                df = pd.read_csv(cand, index_col=0)
+                topic_obs_names = df.index.astype(str).tolist()
+                topic_mat = df.to_numpy(dtype=np.float32)
             break
 
     if topic_mat is None:
         try:
             import torch
+            from torch.utils.data import DataLoader, TensorDataset
             from scdori import get_latent_topics, load_downstream_model
             from scdori.configuration import load_notebook_config
 
             settings = load_notebook_config(str(scdori_config_path))
-            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-            model, rna_mc, atac_mc, _ = load_downstream_model(settings, device=device)
-            topic_mat = np.asarray(get_latent_topics(model, rna_mc, atac_mc, device=device), dtype=np.float32)
+            fit = load_downstream_model(settings)
+            all_dataset = TensorDataset(torch.arange(fit.rna.n_obs))
+            all_loader = DataLoader(
+                all_dataset,
+                batch_size=int(getattr(fit.config, "batch_size_cell_prediction", 256)),
+                shuffle=False,
+            )
+            topic_mat = np.asarray(
+                get_latent_topics(
+                    fit.model,
+                    fit.device,
+                    all_loader,
+                    fit.rna,
+                    fit.atac,
+                    fit.num_cells,
+                    fit.tf_indices,
+                    fit.onehot_batch,
+                ),
+                dtype=np.float32,
+            )
+            topic_obs_names = fit.rna.obs_names.astype(str).tolist()
         except Exception as exc:
             raise FileNotFoundError(
                 f"Could not find or extract scDoRI cell×Topic matrix under {grn_dir} "
@@ -68,11 +190,14 @@ def _extract_scdori_topics_and_grn(
         )
     leading_genes = pd.read_csv(genes_path)
     leading_tfs = pd.read_csv(tfs_path)
-    return topic_mat, leading_tfs, leading_genes
+    return topic_mat, topic_obs_names, leading_tfs, leading_genes
 
 
 def _generate_synthetic_scdori_outputs(adata_rna, n_topics: int = 16, seed: int = 42):
     """Synthesize non-collapsed scDoRI-compatible outputs aligned with synthetic multiome states."""
+    import numpy as np
+    import pandas as pd
+
     rng = np.random.default_rng(seed)
     n_cells = adata_rna.n_obs
     states = adata_rna.obs["celltype"].astype(str).to_numpy()
@@ -122,6 +247,9 @@ def audit_topic_collapse(
     collapse_warn_frac: float = 0.90,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Quantify Topic utilization, entropy, and detect mode/topic collapse red lines."""
+    import numpy as np
+    import pandas as pd
+
     n_topics = topic_mat.shape[1]
     max_act = topic_mat.max(axis=0)
     mean_act = topic_mat.mean(axis=0)
@@ -176,6 +304,8 @@ def main() -> None:
     args = parser.parse_args()
 
     import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
     import scanpy as sc
     import yaml
     from sklearn.metrics import adjusted_rand_score, silhouette_score
@@ -192,8 +322,16 @@ def main() -> None:
 
     if args.synthetic:
         topic_mat, leading_tfs, leading_genes = _generate_synthetic_scdori_outputs(adata)
+        topic_obs_names = None
     else:
-        topic_mat, leading_tfs, leading_genes = _extract_scdori_topics_and_grn(scdori_cfg_path, adata)
+        topic_mat, topic_obs_names, leading_tfs, leading_genes = _extract_scdori_topics_and_grn(scdori_cfg_path, adata)
+
+    if topic_obs_names is not None and len(topic_obs_names) == topic_mat.shape[0]:
+        obs_to_idx = {obs: i for i, obs in enumerate(topic_obs_names)}
+        shared_obs = [obs for obs in adata.obs_names.astype(str) if obs in obs_to_idx]
+        if shared_obs:
+            adata = adata[shared_obs].copy()
+            topic_mat = topic_mat[[obs_to_idx[obs] for obs in shared_obs]]
 
     if topic_mat.shape[0] != adata.n_obs:
         n_min = min(topic_mat.shape[0], adata.n_obs)
@@ -270,16 +408,11 @@ def main() -> None:
     top_k = int(sc_cfg["top_k_topics"])
     top_topic_ids = [int(t.split("_")[1]) for t in diag_df["topic"].head(top_k).tolist()]
 
-    topic_col = "topic" if "topic" in leading_tfs.columns else leading_tfs.columns[0]
-    tf_col = "tf" if "tf" in leading_tfs.columns else leading_tfs.columns[1]
-    gene_topic_col = "topic" if "topic" in leading_genes.columns else leading_genes.columns[0]
-    gene_name_col = "gene" if "gene" in leading_genes.columns else leading_genes.columns[1]
-
     dot_genes: list[str] = []
     egrn_records: list[dict[str, Any]] = []
     for tid in top_topic_ids:
-        tfs_t = leading_tfs[leading_tfs[topic_col] == tid][tf_col].astype(str).tolist()[: int(sc_cfg["top_tfs_per_topic"])]
-        genes_t = leading_genes[leading_genes[gene_topic_col] == tid][gene_name_col].astype(str).tolist()[: int(sc_cfg["top_genes_per_topic"])]
+        tfs_t = extract_topic_tfs(leading_tfs, tid, int(sc_cfg["top_tfs_per_topic"]))
+        genes_t = extract_topic_genes(leading_genes, tid, int(sc_cfg["top_genes_per_topic"]))
         for tf in tfs_t:
             if tf in adata.var_names and tf not in dot_genes:
                 dot_genes.append(tf)

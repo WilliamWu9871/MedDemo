@@ -68,6 +68,7 @@ def main() -> None:
         selected = filter_genes(
             adata_ref, cell_count_cutoff=5, cell_percentage_cutoff2=0.03, nonz_mean_cutoff=1.12
         )
+        plt.close("all")
     adata_ref = adata_ref[:, selected].copy()
 
     use_gpu = torch.cuda.is_available()

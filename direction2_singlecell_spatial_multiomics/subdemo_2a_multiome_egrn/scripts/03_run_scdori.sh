@@ -12,14 +12,18 @@ NB_DIR="${SCDORI_DIR}/docs/notebooks"
 
 CONFIG_JSON="${SUB2A_ROOT}/configs/scdori_pbmc_hg38.json"
 STAGE="all"   # preprocessing | training | downstream | all
+KERNEL_NAME=""
+CLEAN_CHECKPOINTS=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) CONFIG_JSON="$2"; shift 2 ;;
     --stage) STAGE="$2"; shift 2 ;;
+    --kernel) KERNEL_NAME="$2"; shift 2 ;;
+    --clean-checkpoints) CLEAN_CHECKPOINTS=true; shift ;;
     *)
       echo "Unknown argument: $1" >&2
-      echo "Usage: $0 [--config configs/scdori_pbmc_hg38.json] [--stage preprocessing|training|downstream|all]" >&2
+      echo "Usage: $0 [--config configs/scdori_pbmc_hg38.json] [--stage preprocessing|training|downstream|all] [--kernel meddemo_dir2_py311] [--clean-checkpoints]" >&2
       exit 1
       ;;
   esac
@@ -39,6 +43,17 @@ if [[ ! -f "${CONFIG_JSON}" ]]; then
   exit 1
 fi
 
+if [[ -z "${KERNEL_NAME}" ]] && command -v jupyter >/dev/null 2>&1; then
+  if jupyter kernelspec list 2>/dev/null | grep -qw "meddemo_dir2_py311"; then
+    KERNEL_NAME="meddemo_dir2_py311"
+  fi
+fi
+
+if [[ "${CLEAN_CHECKPOINTS}" == "true" ]]; then
+  echo "[2A Step 3] Cleaning existing phase1/phase2 checkpoints under ${SUB2A_ROOT}/outputs/scdori/..."
+  rm -rf "${SUB2A_ROOT}/outputs/scdori/phase1" "${SUB2A_ROOT}/outputs/scdori/phase2"
+fi
+
 OUT_NB_DIR="${SUB2A_ROOT}/outputs/scdori/executed_notebooks"
 mkdir -p "${OUT_NB_DIR}"
 
@@ -46,10 +61,14 @@ run_nb() {
   local nb_name="$1"
   local in_nb="${NB_DIR}/${nb_name}.ipynb"
   local out_nb="${OUT_NB_DIR}/${nb_name}.executed.ipynb"
-  echo "[2A Step 3] Executing ${in_nb} with CONFIG_FILE=${CONFIG_JSON}..."
+  local kernel_args=()
+  if [[ -n "${KERNEL_NAME}" ]]; then
+    kernel_args=(-k "${KERNEL_NAME}")
+  fi
+  echo "[2A Step 3] Executing ${in_nb} with SCDORI_CONFIG_FILE=${CONFIG_JSON} (kernel=${KERNEL_NAME:-default})..."
   (
     cd "${SUB2A_ROOT}"
-    papermill "${in_nb}" "${out_nb}" -p CONFIG_FILE "${CONFIG_JSON}"
+    SCDORI_CONFIG_FILE="${CONFIG_JSON}" papermill "${in_nb}" "${out_nb}" "${kernel_args[@]}"
   )
 }
 

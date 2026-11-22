@@ -287,6 +287,27 @@ def main() -> None:
     adata_atac = adata_atac[common].copy()
     adata_atac.layers["tfidf"] = _compute_tfidf(adata_atac.X)
 
+    # Ensure multi-group celltype annotations exist so scDoRI downstream clustermaps & silhouette never fail on 1 label
+    if adata_rna.obs[celltype_col].astype(str).nunique() <= 1 and adata_rna.n_obs >= 20:
+        tmp_cl = adata_rna.copy()
+        tmp_cl.X = tmp_cl.layers["log1p_norm"].copy()
+        if "highly_variable" in tmp_cl.var and int(tmp_cl.var["highly_variable"].sum()) >= 50:
+            tmp_cl = tmp_cl[:, tmp_cl.var["highly_variable"]].copy()
+        n_pcs = min(30, tmp_cl.n_vars - 1, tmp_cl.n_obs - 1)
+        if n_pcs >= 2:
+            sc.pp.pca(tmp_cl, n_comps=n_pcs)
+            sc.pp.neighbors(tmp_cl, n_neighbors=min(15, max(5, tmp_cl.n_obs - 1)))
+        else:
+            sc.pp.neighbors(tmp_cl, use_rep="X", n_neighbors=min(15, max(5, tmp_cl.n_obs - 1)))
+        sc.tl.leiden(tmp_cl, resolution=0.5, key_added="leiden_init")
+        inferred = tmp_cl.obs["leiden_init"].astype(str).map(lambda s: f"Cluster_{s}")
+        adata_rna.obs[celltype_col] = inferred.to_numpy()
+        adata_atac.obs[celltype_col] = inferred.to_numpy()
+        print(
+            f"[2A Step 1] Inferred {adata_rna.obs[celltype_col].nunique()} Leiden clusters "
+            f"into obs['{celltype_col}'] for unannotated cells."
+        )
+
     # Export MuData + raw h5ads for scDoRI
     mdata = mu.MuData({"rna": adata_rna, "atac": adata_atac})
     mdata.write_h5mu(proc_dir / "multiome.h5mu")

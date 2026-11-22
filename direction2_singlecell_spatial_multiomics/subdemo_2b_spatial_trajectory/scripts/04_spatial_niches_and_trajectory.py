@@ -72,7 +72,9 @@ def main() -> None:
     adata_niche = ad.AnnData(X=niche_feat, obs=adata.obs.copy())
     sc.pp.neighbors(adata_niche, use_rep="X", n_neighbors=min(15, max(5, adata.n_obs // 20)))
     sc.tl.leiden(adata_niche, resolution=float(cfg["niches"]["leiden_resolution"]), key_added="spatial_niche")
-    adata.obs["spatial_niche"] = adata_niche.obs["spatial_niche"].astype(str).map(lambda s: f"Niche_{s}")
+    adata.obs["spatial_niche"] = pd.Categorical(
+        adata_niche.obs["spatial_niche"].astype(str).map(lambda s: f"Niche_{s}")
+    )
 
     # 2. Paper 3 NMF Tissue Microenvironments (TMs, mirroring GBM_space_paper 2.3.cell2location_NMF)
     n_tm = min(int(cfg["niches"]["nmf_n_factors"]), len(state_cols), max(2, adata.n_obs // 10))

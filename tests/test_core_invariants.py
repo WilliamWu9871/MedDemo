@@ -101,9 +101,10 @@ class TestDirection2HelpersAndConfigs(unittest.TestCase):
         )
 
     def test_scdori_json_configs(self) -> None:
-        cfg_dir = (
-            REPO_ROOT
-            / "direction2_singlecell_spatial_multiomics/subdemo_2a_multiome_egrn/configs"
+        sub2a_root = REPO_ROOT / "direction2_singlecell_spatial_multiomics/subdemo_2a_multiome_egrn"
+        cfg_dir = sub2a_root / "configs"
+        ext_motif_dir = (
+            REPO_ROOT / "direction2_singlecell_spatial_multiomics/external/scDoRI/assets/motif_database"
         )
         for fname in ("scdori_pbmc_hg38.json", "scdori_gbm_hg38.json"):
             data = json.loads((cfg_dir / fname).read_text(encoding="utf-8"))
@@ -116,6 +117,56 @@ class TestDirection2HelpersAndConfigs(unittest.TestCase):
             self.assertEqual(data["preprocessing"]["atac_adata_file_name"], "atac_raw.h5ad")
             self.assertTrue(data["training"]["freeze_phase1_in_grn"])
             self.assertTrue(data["training"]["cache_frozen_grn"])
+            # Relative paths in scDoRI JSON resolve against config's parent directory (configs/)
+            self.assertEqual(
+                (cfg_dir / data["preprocessing"]["data_dir"]).resolve(),
+                (sub2a_root / "data/processed").resolve(),
+            )
+            self.assertEqual(
+                (cfg_dir / data["preprocessing"]["motif_directory"]).resolve(),
+                ext_motif_dir.resolve(),
+            )
+            self.assertEqual(
+                (cfg_dir / data["training"]["weights_folder_scdori"]).resolve(),
+                (sub2a_root / "outputs/scdori/phase1").resolve(),
+            )
+            self.assertEqual(
+                (cfg_dir / data["training"]["weights_folder_grn"]).resolve(),
+                (sub2a_root / "outputs/scdori/phase2").resolve(),
+            )
+            self.assertEqual(
+                (cfg_dir / data["downstream"]["grn_output"]).resolve(),
+                (sub2a_root / "outputs/scdori/downstream").resolve(),
+            )
+
+    def test_sanity_check_extractors(self) -> None:
+        mod = _load_module(
+            "sanity_cmp",
+            REPO_ROOT
+            / "direction2_singlecell_spatial_multiomics/subdemo_2a_multiome_egrn/scripts/04_sanity_check_compare.py",
+        )
+        official_tfs = [
+            {"topic": "Topic_2", "tf": "SOX2", "minmax_consensus": 0.91},
+            {"topic": "Topic_2", "tf": "OLIG2", "minmax_consensus": 0.85},
+            {"topic": "Topic_3", "tf": "TCF7", "minmax_consensus": 0.80},
+        ]
+        official_genes = [
+            {"Topic": "Topic_2", "Leading genes": "SOX2, OLIG2, EGFR, DLL3, PDGFRA"},
+            {"Topic": "Topic_3", "Leading genes": "TCF7, LEF1"},
+        ]
+        self.assertEqual(mod.extract_topic_tfs(official_tfs, 2, top_n=3), ["SOX2", "OLIG2"])
+        self.assertEqual(mod.extract_topic_genes(official_genes, 2, top_n=3), ["SOX2", "OLIG2", "EGFR"])
+
+        syn_tfs = [
+            {"topic": 2, "tf": "PAX5", "score": 1.0},
+            {"topic": 2, "tf": "EBF1", "score": 0.85},
+        ]
+        syn_genes = [
+            {"topic": 2, "gene": "CD19", "weight": 2.1},
+            {"topic": 2, "gene": "MS4A1", "weight": 1.8},
+        ]
+        self.assertEqual(mod.extract_topic_tfs(syn_tfs, 2, top_n=2), ["PAX5", "EBF1"])
+        self.assertEqual(mod.extract_topic_genes(syn_genes, 2, top_n=2), ["CD19", "MS4A1"])
 
 
 if __name__ == "__main__":
