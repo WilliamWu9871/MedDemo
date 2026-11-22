@@ -67,7 +67,7 @@ def _run_cox_fold(
     seed: int,
     fold: int,
 ) -> tuple[dict[str, Any], pd.DataFrame]:
-    cols = list(feature_cols)
+    cols = list(dict.fromkeys(feature_cols))
     tr_df = train_pat[cols + ["os_time", "os_event"]].copy()
     va_df = val_pat[cols + ["os_time", "os_event"]].copy()
 
@@ -94,7 +94,8 @@ def _run_cox_fold(
         "n_train_patients": len(tr_df),
         "n_val_patients": len(va_df),
     }
-    oof_df = val_pat[["patient_id", "os_time", "os_event", "pTSR"] + cols].copy()
+    oof_cols = list(dict.fromkeys(["patient_id", "os_time", "os_event", "pTSR"] + cols))
+    oof_df = val_pat[oof_cols].copy().reset_index(drop=True)
     oof_df["seed"] = seed
     oof_df["fold"] = fold
     oof_df["exp_name"] = exp_name
@@ -293,7 +294,8 @@ def _run_dl_fold(
         "n_val_patients": len(val_ds),
     }
 
-    oof_df = val_pat_df[["patient_id", "os_time", "os_event", "pTSR"] + clinical_cols].copy().reset_index(drop=True)
+    oof_cols = list(dict.fromkeys(["patient_id", "os_time", "os_event", "pTSR"] + clinical_cols))
+    oof_df = val_pat_df[oof_cols].copy().reset_index(drop=True)
     risk_by_pat = {p["patient_id"]: float(r) for p, r in zip(val_ds.patients, va_risks)}
     oof_df["seed"] = seed
     oof_df["fold"] = fold
