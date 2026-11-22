@@ -1,0 +1,44 @@
+# Sub-demo 2B Configuration (HEST/GBMspace Visium + cell2location + Spatial DPT Trajectory)
+paths:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  squidpy_dir: outputs/squidpy
+  cell2location_dir: outputs/cell2location
+  figures_dir: outputs/figures
+  tables_dir: outputs/tables
+
+hest_query:
+  repo_id: MahmoodLab/hest
+  organ: Brain
+  st_technology: Visium
+  preferred_oncotree: [GBM, HGG, GLIO, LGG]
+  max_samples: 3
+  download_full_wsi: false
+
+reference:
+  max_cells: 10000
+  cell_state_col: cell_state
+  batch_col: sample
+
+qc:
+  min_shared_genes: 8000
+  marker_genes: [VEGFA, CD68, EGFR, OLIG1, GFAP, CD163, PECAM1, VIM, HILPDA, SOX2]
+
+cell2location:
+  N_cells_per_location: 30     # Paper 3 Methods exact value
+  detection_alpha: 200         # Paper 3 Methods exact value (lower to 20 if strong batch shift)
+  ref_max_epochs: 250          # Paper 3 uses 400
+  ref_batch_size: 2500
+  ref_lr: 0.002
+  spatial_max_epochs: 5000     # Paper 3 uses 6000
+  spatial_batch_size: 2500
+  min_moran_i_warn: 0.15       # Salt-and-pepper noise red-line check
+
+niches:
+  leiden_resolution: 0.5
+  nmf_n_factors: 6             # Tissue Microenvironments (TMs, echoing Paper 3 NMF)
+
+trajectory:
+  root_state_candidates: [Dev_OPC_like, OPC-like, AC_progenitor_like, AC-progenitor-like, NPC-like]
+  malignant_prefixes: [Dev_, AC_, OPC, NPC, MES, Hypox, Gliosis, Malignant]
+  min_tumor_purity: 0.30

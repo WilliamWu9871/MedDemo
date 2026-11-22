@@ -1,0 +1,38 @@
+# Sub-demo 2A Configuration (Paired snRNA + snATAC Multiome -> MultiVI + scDoRI)
+data:
+  source: pbmc3k                # pbmc3k | pbmc10k | h5ad | synthetic
+  raw_dir: data/raw
+  processed_dir: data/processed
+  sample_name: pbmc_multiome
+  celltype_col: celltype
+  batch_col: sample
+
+qc:
+  min_genes_rna: 200
+  max_genes_rna: 6000
+  min_counts_rna: 500
+  max_pct_mt: 15.0
+  n_top_genes: 2500
+  min_cells_peak: 10
+  max_cells_peak_frac: 0.90
+
+multivi:
+  output_dir: outputs/multivi
+  n_latent: 20
+  max_epochs: 150
+  batch_size: 128
+  leiden_resolution: 0.6
+
+scdori:
+  config_json: configs/scdori_pbmc_hg38.json
+  executed_nb_dir: outputs/scdori/executed_notebooks
+  downstream_dir: outputs/scdori/downstream
+
+sanity_checks:
+  topic_active_thresh: 0.10     # Paper 2 criterion: topics with max activity > 0.1
+  collapse_warn_frac: 0.90      # Warn if >= 90% of topics collapse near 0
+  top_k_topics: 2
+  top_tfs_per_topic: 3
+  top_genes_per_topic: 5
+  figures_dir: outputs/figures
+  tables_dir: outputs/tables

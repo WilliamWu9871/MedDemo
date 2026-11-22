@@ -1,0 +1,45 @@
+name: meddemo_sc_spatial
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - bedtools
+  - htslib
+  - pip:
+      # Isolated from Direction 1 (TRIDENT/OpenSlide/pyvips) to avoid C++/NumPy conflicts.
+      # On Linux CUDA 12.1 servers, install PyTorch CUDA wheels first if needed:
+      #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+      - numpy>=1.24,<2
+      - pandas>=1.5,<3
+      - scipy>=1.10,<1.17
+      - anndata>=0.10,<0.12
+      - scanpy>=1.10,<1.12
+      - pyarrow<26
+      - pynndescent<0.7
+      - mudata
+      - muon
+      - squidpy
+      - scvi-tools
+      - cell2location
+      - torch>=2.1
+      - scikit-learn>=1.2
+      - leidenalg
+      - igraph
+      - umap-learn
+      - harmonypy>=0.0.10,<0.1
+      - gtfparse>=2.5,<3
+      - tangermeme>=0.4.0,<0.5
+      - decoupler
+      - huggingface_hub
+      - requests
+      - pyyaml
+      - tqdm
+      - matplotlib
+      - seaborn
+      - Pillow
+      - papermill
+      - jupyter
+      - ipykernel

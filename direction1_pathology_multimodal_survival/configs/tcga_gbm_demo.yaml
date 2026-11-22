@@ -1,0 +1,64 @@
+# Direction 1 Alternative Demo Config — TCGA-GBM (Glioblastoma)
+experiment:
+  name: tcga_gbm_demo
+  project: TCGA-GBM
+  n_patients: 70
+  slide_type: Diagnostic Slide
+  min_os_days: 1
+
+paths:
+  wsi_dir: data/tcga_gbm/svs
+  metadata_dir: data/tcga_gbm/metadata
+  clinical_csv: data/tcga_gbm/metadata/clinical.csv
+  trident_job_dir: outputs/tcga_gbm/trident_feats
+  splits_csv: splits/tcga_gbm_splits.csv
+  priors_csv: outputs/tcga_gbm/priors/slide_priors.csv
+  ablation_dir: outputs/tcga_gbm/ablation
+  attention_dir: outputs/tcga_gbm/attention
+  report_dir: outputs/tcga_gbm/report
+  thumbnails_dir: data/tcga_gbm/thumbnails
+
+trident:
+  patch_encoder: uni_v1
+  fallback_encoder: resnet50
+  mag: 20
+  patch_size: 256
+  remove_artifacts: true
+  remove_penmarks: true
+  batch_size: 64
+
+splits:
+  n_splits: 5
+  seeds: [42, 123, 2026]
+  default_seed: 42
+
+prior:
+  backend: color_heuristic   # color_heuristic | tiatoolbox
+  tsr_num_bins: 8
+
+data:
+  clinical_cols: [age, sex, stage]
+  max_patches_train: 8192
+  max_patches_eval: null
+
+model:
+  n_bins: 4
+  hidden_dim: 256
+  n_heads: 4
+  dropout: 0.25
+
+training:
+  batch_size: 1
+  grad_accum_steps: 16
+  epochs: 25
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+  nll_alpha: 0.15
+  early_stop_patience: 8
+  num_workers: 0
+
+evaluation:
+  heatmap_num_slides: 4
+  bg_rgb_threshold: 225
+  bg_warn_fraction: 0.20
+  rcs_knots_percentiles: [5, 35, 65, 95]

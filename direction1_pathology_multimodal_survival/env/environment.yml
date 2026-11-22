@@ -1,0 +1,34 @@
+name: meddemo_patho
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - openslide
+  - libvips
+  - pip:
+      # On Linux CUDA 12.1 servers, install PyTorch CUDA wheels first if needed:
+      #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+      - torch>=2.4
+      - torchvision
+      - openslide-python
+      - openslide-bin
+      - lifelines>=0.29
+      - scikit-survival
+      - scikit-learn>=1.4
+      - statsmodels
+      - patsy
+      - shap
+      - h5py
+      - pandas>=2.0
+      - numpy>=1.24,<2
+      - scipy
+      - matplotlib
+      - seaborn
+      - pyyaml
+      - tqdm
+      - Pillow
+      - opencv-python-headless
+      - requests
+      - huggingface_hub

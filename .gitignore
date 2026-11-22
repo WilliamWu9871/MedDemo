@@ -1,0 +1,53 @@
+# Large biological data, slide images, matrices, and downloaded models
+**/data/
+!**/data/.gitkeep
+**/outputs/
+!**/outputs/.gitkeep
+**/external/
+!**/external/.gitkeep
+**/checkpoints/
+**/splits/*.csv
+!**/splits/.gitkeep
+
+# Raw & processed biomedical file formats
+*.svs
+*.tif
+*.tiff
+*.ndpi
+*.scn
+*.mrxs
+*.h5
+*.hdf5
+*.h5ad
+*.h5mu
+*.loom
+*.zarr
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.npz
+*.npy
+*.bed.gz
+*.gtf.gz
+*.fa
+*.fa.gz
+*.fai
+*.fastq
+*.fastq.gz
+*.bam
+*.bai
+*.cram
+
+# Python & Jupyter artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store
+*.log
+
+# Large reference PDF papers (keep repo lightweight for Colab clone)
+*.pdf
