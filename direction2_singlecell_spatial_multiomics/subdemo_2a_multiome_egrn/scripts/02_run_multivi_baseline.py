@@ -47,15 +47,10 @@ def main() -> None:
 
     batch_col = cfg["data"].get("batch_col", "sample")
     celltype_col = cfg["data"].get("celltype_col", "celltype")
-
-    adata_paired = ad.concat([adata_rna, adata_atac], axis=1, merge="first")
-    adata_paired.obs[batch_col] = adata_rna.obs[batch_col].astype(str)
+    if batch_col in adata_rna.obs:
+        adata_rna.obs[batch_col] = adata_rna.obs[batch_col].astype(str)
     if celltype_col in adata_rna.obs:
-        adata_paired.obs[celltype_col] = adata_rna.obs[celltype_col].astype(str)
-    adata_paired.var["modality"] = (
-        ["Gene Expression"] * adata_rna.n_vars + ["Peaks"] * adata_atac.n_vars
-    )
-    adata_paired = scvi.data.organize_multiome_anndatas(adata_paired)
+        adata_rna.obs[celltype_col] = adata_rna.obs[celltype_col].astype(str)
 
     mv_cfg = cfg["multivi"]
     out_dir = SUB2A_ROOT / mv_cfg["output_dir"]
@@ -67,13 +62,42 @@ def main() -> None:
     leiden_res = float(mv_cfg["leiden_resolution"])
 
     scvi.settings.seed = 42
-    scvi.model.MULTIVI.setup_anndata(adata_paired, batch_key=batch_col)
-    model = scvi.model.MULTIVI(
-        adata_paired,
-        n_genes=adata_rna.n_vars,
-        n_regions=adata_atac.n_vars,
-        n_latent=n_latent,
-    )
+    if hasattr(scvi.model.MULTIVI, "setup_mudata"):
+        mdata_paired = mu.MuData({"rna": adata_rna, "atac": adata_atac})
+        mdata_paired.update()
+        use_batch = batch_col if batch_col in adata_rna.obs else None
+        modalities = {"rna_layer": "rna", "atac_layer": "atac"}
+        if use_batch is not None:
+            modalities["batch_key"] = "rna"
+        scvi.model.MULTIVI.setup_mudata(
+            mdata_paired,
+            rna_layer=None,
+            atac_layer=None,
+            batch_key=use_batch,
+            modalities=modalities,
+        )
+        model = scvi.model.MULTIVI(
+            mdata_paired,
+            n_genes=adata_rna.n_vars,
+            n_regions=adata_atac.n_vars,
+            n_latent=n_latent,
+        )
+    else:
+        adata_paired = ad.concat([adata_rna, adata_atac], axis=1, merge="first")
+        adata_paired.obs[batch_col] = adata_rna.obs[batch_col].astype(str)
+        if celltype_col in adata_rna.obs:
+            adata_paired.obs[celltype_col] = adata_rna.obs[celltype_col].astype(str)
+        adata_paired.var["modality"] = (
+            ["Gene Expression"] * adata_rna.n_vars + ["Peaks"] * adata_atac.n_vars
+        )
+        adata_paired = scvi.data.organize_multiome_anndatas(adata_paired)
+        scvi.model.MULTIVI.setup_anndata(adata_paired, batch_key=batch_col)
+        model = scvi.model.MULTIVI(
+            adata_paired,
+            n_genes=adata_rna.n_vars,
+            n_regions=adata_atac.n_vars,
+            n_latent=n_latent,
+        )
     model.train(max_epochs=max_epochs, batch_size=batch_size)
 
     latent = model.get_latent_representation()
