@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import h5py
 import numpy as np
@@ -68,6 +68,24 @@ def is_valid_trident_h5(h5_path: Path) -> bool:
         return False
 
 
+def preload_h5_cache(
+    h5_paths: Iterable[Path],
+    max_cache_gb: float = 8.0,
+) -> tuple[dict[Path, tuple[np.ndarray, np.ndarray]], float]:
+    """Preload TRIDENT .h5 features/coords into RAM once up to max_cache_gb."""
+    cache: dict[Path, tuple[np.ndarray, np.ndarray]] = {}
+    max_bytes = int(max_cache_gb * (1024**3))
+    total_bytes = 0
+    for path in dict.fromkeys(h5_paths):
+        feats, coords = _load_trident_h5(path)
+        item_bytes = int(feats.nbytes + coords.nbytes)
+        if cache and (total_bytes + item_bytes) > max_bytes:
+            break
+        cache[path] = (feats, coords)
+        total_bytes += item_bytes
+    return cache, total_bytes / (1024**3)
+
+
 class PatientMILDataset(Dataset):
     """Bag dataset grouped by ``patient_id`` to prevent slide-to-patient leakage.
 
@@ -85,6 +103,7 @@ class PatientMILDataset(Dataset):
         training: bool = True,
         seed: int = 42,
         h5_index: tuple[dict[str, Path], dict[str, Path]] | None = None,
+        feature_cache: dict[Path, tuple[np.ndarray, np.ndarray]] | None = None,
     ):
         self.feats_dir = Path(feats_dir)
         self.clinical_cols = list(clinical_cols)
@@ -93,6 +112,7 @@ class PatientMILDataset(Dataset):
         self.training = training
         self.rng = np.random.default_rng(seed)
         self._exact_h5, self._prefix_h5 = h5_index if h5_index is not None else build_h5_index(self.feats_dir)
+        self.feature_cache = feature_cache
 
         self.patients: list[dict[str, Any]] = []
         for patient_id, grp in records_df.groupby("patient_id", sort=False):
@@ -131,7 +151,11 @@ class PatientMILDataset(Dataset):
         if not self.patients:
             raise ValueError("PatientMILDataset received 0 valid patients.")
 
-        sample_feats, _ = _load_trident_h5(self.patients[0]["h5_paths"][0])
+        first_h5 = self.patients[0]["h5_paths"][0]
+        if self.feature_cache is not None and first_h5 in self.feature_cache:
+            sample_feats = self.feature_cache[first_h5][0]
+        else:
+            sample_feats, _ = _load_trident_h5(first_h5)
         self.feature_dim = int(sample_feats.shape[1])
 
     def _resolve_h5(self, slide_id: str) -> Path:
@@ -151,15 +175,21 @@ class PatientMILDataset(Dataset):
         cursor = 0
 
         for slide_id, h5_path in zip(rec["slide_ids"], rec["h5_paths"]):
-            feats, coords = _load_trident_h5(h5_path)
+            if self.feature_cache is not None and h5_path in self.feature_cache:
+                feats, coords = self.feature_cache[h5_path]
+            else:
+                feats, coords = _load_trident_h5(h5_path)
             n_patches = feats.shape[0]
             feats_list.append(feats)
             coords_list.append(coords)
             slide_offsets.append((slide_id, cursor, cursor + n_patches))
             cursor += n_patches
 
-        bag_feats = np.concatenate(feats_list, axis=0)
-        bag_coords = np.concatenate(coords_list, axis=0)
+        if len(feats_list) == 1:
+            bag_feats, bag_coords = feats_list[0], coords_list[0]
+        else:
+            bag_feats = np.concatenate(feats_list, axis=0)
+            bag_coords = np.concatenate(coords_list, axis=0)
 
         if self.max_patches is not None and bag_feats.shape[0] > self.max_patches:
             if self.training:

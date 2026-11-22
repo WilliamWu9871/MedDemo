@@ -159,7 +159,9 @@ class TokenGuidedMultimodalSurv(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.fusion_transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        self.fusion_transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=1, enable_nested_tensor=False
+        )
 
         # Residual concat of fused CLS + pooled WSI + TSR prior token
         head_in_dim = hidden_dim * 3

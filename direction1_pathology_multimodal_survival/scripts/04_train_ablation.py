@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import copy
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,7 @@ from direction1.dataset import (
     PatientMILDataset,
     build_h5_index,
     is_valid_trident_h5,
+    preload_h5_cache,
     resolve_h5_from_index,
 )
 from direction1.losses import NLLSurvLoss, fit_survival_bins, transform_survival_bins
@@ -373,10 +375,12 @@ def main() -> None:
     exact_h5, prefix_h5 = build_h5_index(feats_dir)
     valid_mask: list[bool] = []
     missing_slides: list[str] = []
+    valid_h5_paths: list[Path] = []
     for sid in merged["slide_id"].astype(str):
         h5_path = resolve_h5_from_index(exact_h5, prefix_h5, sid)
         if h5_path is not None and is_valid_trident_h5(h5_path):
             valid_mask.append(True)
+            valid_h5_paths.append(h5_path)
         else:
             valid_mask.append(False)
             missing_slides.append(sid)
@@ -398,6 +402,14 @@ def main() -> None:
             f"features under {feats_dir} (e.g. {missing_slides[:5]}). "
             f"Proceeding with {merged['patient_id'].nunique()} aligned patients ({len(merged)} slides)."
         )
+
+    t_cache = time.monotonic()
+    feature_cache, cached_gb = preload_h5_cache(valid_h5_paths, max_cache_gb=8.0)
+    print(
+        f"[Stage 3B] Cached {len(feature_cache)}/{len(set(valid_h5_paths))} slides in RAM "
+        f"({cached_gb:.2f} GB) in {time.monotonic() - t_cache:.1f}s",
+        flush=True,
+    )
 
     all_metrics: list[dict[str, Any]] = []
     all_oofs: list[pd.DataFrame] = []
@@ -481,6 +493,7 @@ def main() -> None:
                 training=True,
                 seed=seed + fold,
                 h5_index=(exact_h5, prefix_h5),
+                feature_cache=feature_cache,
             )
             val_ds = PatientMILDataset(
                 va_slides,
@@ -491,6 +504,7 @@ def main() -> None:
                 training=False,
                 seed=seed + fold,
                 h5_index=(exact_h5, prefix_h5),
+                feature_cache=feature_cache,
             )
 
             for exp_name in dl_exps:
@@ -515,7 +529,8 @@ def main() -> None:
                 + " | ".join(
                     f"{row['exp_name'].split('_', 2)[-1]}={row['val_cindex']:.3f}"
                     for row in all_metrics[-5:]
-                )
+                ),
+                flush=True,
             )
 
     metrics_df = pd.DataFrame(all_metrics)
