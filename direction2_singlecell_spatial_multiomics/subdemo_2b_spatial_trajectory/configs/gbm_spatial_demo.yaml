@@ -30,7 +30,7 @@ cell2location:
   ref_max_epochs: 250          # Paper 3 uses 400
   ref_batch_size: 2500
   ref_lr: 0.002
-  spatial_max_epochs: 5000     # Paper 3 uses 6000
+  spatial_max_epochs: 2500     # Paper 3 uses 6000; 2500 runs fast on Colab L4
   spatial_batch_size: 2500
   min_moran_i_warn: 0.15       # Salt-and-pepper noise red-line check
 

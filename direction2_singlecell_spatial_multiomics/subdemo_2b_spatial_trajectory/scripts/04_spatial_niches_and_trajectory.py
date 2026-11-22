@@ -123,7 +123,9 @@ def main() -> None:
             print(f"[2B Step 4] scFates skipped ({exc}); using Scanpy DPT pseudotime.")
 
     adata.obs["dpt_pseudotime"] = np.nan
-    adata.obs.loc[adata_traj.obs_names, "dpt_pseudotime"] = adata_traj.obs["dpt_pseudotime"].to_numpy()
+    pt_vals = np.asarray(adata_traj.obs["dpt_pseudotime"].to_numpy(), dtype=np.float64)
+    pt_vals[~np.isfinite(pt_vals)] = np.nan
+    adata.obs.loc[adata_traj.obs_names, "dpt_pseudotime"] = pt_vals
 
     # Export summary tables
     comp_df = pd.DataFrame(P, index=adata.obs_names, columns=state_cols)

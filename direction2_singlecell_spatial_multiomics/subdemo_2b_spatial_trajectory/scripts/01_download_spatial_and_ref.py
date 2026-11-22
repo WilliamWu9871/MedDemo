@@ -15,6 +15,30 @@ SUB2B_ROOT = Path(__file__).resolve().parents[1]
 
 _ENSEMBL_RE = re.compile(r"^ENS[A-Z]*G\d{6,}(?:\.\d+)?$", re.IGNORECASE)
 
+TENX_GBM_URLS = {
+    "visium_h5": (
+        "https://cf.10xgenomics.com/samples/spatial-exp/1.2.0/"
+        "Parent_Visium_Human_Glioblastoma/Parent_Visium_Human_Glioblastoma_filtered_feature_bc_matrix.h5"
+    ),
+    "visium_spatial_tar": (
+        "https://cf.10xgenomics.com/samples/spatial-exp/1.2.0/"
+        "Parent_Visium_Human_Glioblastoma/Parent_Visium_Human_Glioblastoma_spatial.tar.gz"
+    ),
+    "sc_h5": (
+        "https://cf.10xgenomics.com/samples/cell-exp/4.0.0/"
+        "Parent_SC3v3_Human_Glioblastoma/Parent_SC3v3_Human_Glioblastoma_filtered_feature_bc_matrix.h5"
+    ),
+}
+
+GBM_STATE_MARKERS: dict[str, list[str]] = {
+    "Dev_OPC_like": ["OLIG1", "OLIG2", "SOX2", "PDGFRA", "DLL3", "CSPG4"],
+    "AC_progenitor_like": ["EGFR", "GFAP", "SOX9", "CLU", "SLC1A3", "AQP4"],
+    "AC_gliosis_like": ["VIM", "CD44", "CHI3L1", "TIMP1", "SERPINA3", "S100B"],
+    "Hypoxic": ["VEGFA", "HILPDA", "CA9", "LDHA", "ADM", "ENO1"],
+    "Myeloid_TAM": ["CD68", "CD163", "CSF1R", "TREM2", "C1QA", "AIF1"],
+    "Vascular": ["PECAM1", "VWF", "CLDN5", "FLT1", "CDH5", "ESAM"],
+}
+
 
 def detect_gene_id_type(names: Iterable[str]) -> str:
     """Classify a collection of gene identifiers as 'ensembl', 'symbol', or 'mixed'."""
@@ -286,10 +310,178 @@ def generate_synthetic_spatial_and_ref(proc_dir: Path, seed: int = 42) -> tuple[
     return vis_out, ref_out
 
 
+def _stream_download(url: str, dest: Path) -> Path:
+    import requests
+    from tqdm import tqdm
+
+    if dest.exists() and dest.stat().st_size > 0:
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[2B Step 1] Downloading {url} -> {dest}")
+    with requests.get(url, stream=True, timeout=180) as resp:
+        resp.raise_for_status()
+        total = int(resp.headers.get("content-length", 0))
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        with tmp.open("wb") as handle, tqdm(total=total, unit="B", unit_scale=True, desc=dest.name) as pbar:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    handle.write(chunk)
+                    pbar.update(len(chunk))
+        tmp.rename(dest)
+    return dest
+
+
+def download_tenx_gbm_visium(raw_dir: Path, proc_dir: Path) -> list[Path]:
+    """Download open-access 10x Genomics Human Glioblastoma Visium + H&E spatial files."""
+    import tarfile
+    import numpy as np
+    import scanpy as sc
+    import scipy.sparse as sp
+
+    vis_dir = raw_dir / "tenx_gbm_visium"
+    vis_dir.mkdir(parents=True, exist_ok=True)
+
+    h5_name = "Parent_Visium_Human_Glioblastoma_filtered_feature_bc_matrix.h5"
+    tar_name = "Parent_Visium_Human_Glioblastoma_spatial.tar.gz"
+    _stream_download(TENX_GBM_URLS["visium_h5"], vis_dir / h5_name)
+    tar_path = _stream_download(TENX_GBM_URLS["visium_spatial_tar"], vis_dir / tar_name)
+
+    if not (vis_dir / "spatial" / "scalefactors_json.json").exists():
+        with tarfile.open(tar_path, "r:gz") as tf:
+            tf.extractall(path=vis_dir)
+
+    adata = sc.read_visium(vis_dir, count_file=h5_name)
+    adata.var_names_make_unique()
+    if "in_tissue" in adata.obs:
+        in_tissue_mask = adata.obs["in_tissue"].fillna(0).astype(int) == 1
+        if int(in_tissue_mask.sum()) > 0:
+            adata = adata[in_tissue_mask].copy()
+
+    if "spatial" in adata.obsm:
+        adata.obsm["spatial"] = np.asarray(adata.obsm["spatial"], dtype=np.float32)
+
+    if "spatial" in adata.uns and isinstance(adata.uns["spatial"], dict):
+        for lib_data in adata.uns["spatial"].values():
+            meta = lib_data.get("metadata")
+            if isinstance(meta, dict):
+                for k, v in list(meta.items()):
+                    if isinstance(v, (bytes, bytearray, np.bytes_)):
+                        meta[k] = bytes(v).decode("utf-8", errors="replace")
+
+    if not sp.issparse(adata.X):
+        adata.X = sp.csr_matrix(adata.X)
+    adata.obs["sample"] = "10x_Human_GBM_Visium"
+
+    out_p = proc_dir / "visium_sample.h5ad"
+    adata.write_h5ad(out_p)
+    print(f"[2B Step 1][10x_GBM] Prepared Visium ({adata.n_obs} spots × {adata.n_vars} genes) -> {out_p}")
+    return [out_p]
+
+
+def download_tenx_gbm_reference(
+    raw_dir: Path,
+    out_path: Path,
+    max_cells: int,
+    cell_state_col: str,
+    batch_col: str,
+    seed: int = 42,
+) -> Path:
+    """Download open-access 10x Human Glioblastoma scRNA-seq and assign 6 Paper 3 GBM states."""
+    import numpy as np
+    import pandas as pd
+    import scanpy as sc
+    import scipy.sparse as sp
+
+    sc_dir = raw_dir / "tenx_gbm_sc"
+    sc_dir.mkdir(parents=True, exist_ok=True)
+    sc_h5 = _stream_download(
+        TENX_GBM_URLS["sc_h5"],
+        sc_dir / "Parent_SC3v3_Human_Glioblastoma_filtered_feature_bc_matrix.h5",
+    )
+
+    adata_ref = sc.read_10x_h5(sc_h5, gex_only=True)
+    adata_ref.var_names_make_unique()
+    sc.pp.filter_cells(adata_ref, min_genes=200)
+    sc.pp.filter_genes(adata_ref, min_cells=3)
+    adata_ref.X = adata_ref.X.tocsr() if sp.issparse(adata_ref.X) else sp.csr_matrix(adata_ref.X)
+
+    # Cluster on normalized copy while strictly keeping raw integer UMI counts in .X
+    tmp = adata_ref.copy()
+    sc.pp.normalize_total(tmp, target_sum=1e4)
+    sc.pp.log1p(tmp)
+    sc.pp.highly_variable_genes(tmp, n_top_genes=min(2500, tmp.n_vars), flavor="seurat")
+    tmp_hvg = tmp[:, tmp.var["highly_variable"]].copy()
+    sc.pp.pca(tmp_hvg, n_comps=min(30, tmp_hvg.n_vars - 1, tmp_hvg.n_obs - 1))
+    sc.pp.neighbors(tmp_hvg, n_neighbors=15)
+    sc.tl.leiden(tmp_hvg, resolution=0.8, key_added="leiden_ref")
+
+    clusters = sorted(tmp_hvg.obs["leiden_ref"].astype(str).unique().tolist())
+    state_names = list(GBM_STATE_MARKERS.keys())
+    var_upper = {g.upper(): g for g in tmp.var_names}
+
+    # Compute mean normalized marker score per (cluster, state)
+    score_mat = np.zeros((len(clusters), len(state_names)), dtype=np.float32)
+    for s_idx, st in enumerate(state_names):
+        present = [var_upper[m.upper()] for m in GBM_STATE_MARKERS[st] if m.upper() in var_upper]
+        if not present:
+            continue
+        expr = tmp[:, present].X
+        if sp.issparse(expr):
+            expr = expr.toarray()
+        cell_scores = expr.mean(axis=1)
+        for c_idx, cl in enumerate(clusters):
+            mask = (tmp_hvg.obs["leiden_ref"].astype(str) == cl).to_numpy()
+            score_mat[c_idx, s_idx] = float(cell_scores[mask].mean()) if mask.any() else 0.0
+
+    # Standardize scores per state across clusters so rare marker panels still match their peak cluster
+    col_std = score_mat.std(axis=0, keepdims=True)
+    col_std[col_std < 1e-6] = 1.0
+    z_mat = (score_mat - score_mat.mean(axis=0, keepdims=True)) / col_std
+
+    cluster_to_state: dict[str, str] = {}
+    used_clusters: set[int] = set()
+    # First assign each of the 6 Paper 3 states to its highest-scoring distinct cluster
+    pairs = [
+        (float(z_mat[ci, si]), ci, si)
+        for ci in range(len(clusters))
+        for si in range(len(state_names))
+    ]
+    used_states: set[int] = set()
+    for _, ci, si in sorted(pairs, reverse=True):
+        if ci not in used_clusters and si not in used_states:
+            cluster_to_state[clusters[ci]] = state_names[si]
+            used_clusters.add(ci)
+            used_states.add(si)
+    for ci, cl in enumerate(clusters):
+        if cl not in cluster_to_state:
+            best_si = int(np.argmax(z_mat[ci]))
+            cluster_to_state[cl] = state_names[best_si]
+
+    assigned = tmp_hvg.obs["leiden_ref"].astype(str).map(cluster_to_state)
+    adata_ref.obs[cell_state_col] = pd.Categorical(assigned)
+    adata_ref.obs[batch_col] = "10x_GBM_SC3v3"
+
+    if adata_ref.n_obs > max_cells:
+        rng = np.random.default_rng(seed)
+        frac = max_cells / float(adata_ref.n_obs)
+        chosen: list[str] = []
+        for _, grp in adata_ref.obs.groupby(cell_state_col, observed=True):
+            n_take = max(5, int(round(len(grp) * frac)))
+            chosen.extend(rng.choice(grp.index.to_numpy(), size=min(len(grp), n_take), replace=False).tolist())
+        adata_ref = adata_ref[chosen[:max_cells]].copy()
+
+    adata_ref.write_h5ad(out_path)
+    print(
+        f"[2B Step 1][10x_GBM] Prepared scRNA-seq reference ({adata_ref.n_obs} cells, "
+        f"{adata_ref.obs[cell_state_col].nunique()} states) -> {out_path}"
+    )
+    return out_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Sub-demo 2B Step 1: Acquire spatial Visium & scRNA-seq reference")
     parser.add_argument("--config", type=str, default=str(SUB2B_ROOT / "configs/gbm_spatial_demo.yaml"))
-    parser.add_argument("--source", type=str, default="hest", choices=["hest", "local", "synthetic"])
+    parser.add_argument("--source", type=str, default="hest", choices=["hest", "tenx_gbm", "local", "synthetic"])
     parser.add_argument("--visium-h5ad", type=str, default=None, help="Local Visium .h5ad when --source local")
     parser.add_argument("--ref-h5ad", type=str, default=None, help="Local scRNA-seq reference .h5ad")
     parser.add_argument("--seed", type=int, default=42)
@@ -311,8 +503,17 @@ def main() -> None:
         return
 
     if args.source == "hest":
-        saved = download_hest_subset(cfg, raw_dir, proc_dir)
-        print(f"[2B Step 1][HEST] Saved {len(saved)} Visium sample(s) under {proc_dir}")
+        try:
+            saved = download_hest_subset(cfg, raw_dir, proc_dir)
+            print(f"[2B Step 1][HEST] Saved {len(saved)} Visium sample(s) under {proc_dir}")
+        except Exception as exc:
+            print(
+                f"[2B Step 1][WARN] MahmoodLab/hest download unavailable ({exc}). "
+                "Falling back to open-access 10x Genomics Human Glioblastoma Visium..."
+            )
+            saved = download_tenx_gbm_visium(raw_dir, proc_dir)
+    elif args.source == "tenx_gbm":
+        saved = download_tenx_gbm_visium(raw_dir, proc_dir)
     elif args.source == "local":
         if not args.visium_h5ad:
             raise ValueError("--visium-h5ad is required when --source local")
@@ -324,8 +525,8 @@ def main() -> None:
         adata_vis.write_h5ad(proc_dir / "visium_sample.h5ad")
         print(f"[2B Step 1][LOCAL] Copied Visium -> {proc_dir / 'visium_sample.h5ad'}")
 
-    if args.ref_h5ad:
-        ref_cfg = cfg["reference"]
+    ref_cfg = cfg["reference"]
+    if args.ref_h5ad and Path(args.ref_h5ad).exists():
         out_ref = prepare_reference_h5ad(
             ref_path=Path(args.ref_h5ad),
             out_path=proc_dir / "reference_sc.h5ad",
@@ -335,6 +536,20 @@ def main() -> None:
             seed=args.seed,
         )
         print(f"[2B Step 1] Prepared stratified scRNA-seq reference -> {out_ref}")
+    elif args.source in ("hest", "tenx_gbm"):
+        if args.ref_h5ad:
+            print(
+                f"[2B Step 1][WARN] --ref-h5ad '{args.ref_h5ad}' not found on disk. "
+                "Falling back to open-access 10x Genomics Human Glioblastoma scRNA-seq reference..."
+            )
+        download_tenx_gbm_reference(
+            raw_dir=raw_dir,
+            out_path=proc_dir / "reference_sc.h5ad",
+            max_cells=int(ref_cfg["max_cells"]),
+            cell_state_col=ref_cfg["cell_state_col"],
+            batch_col=ref_cfg["batch_col"],
+            seed=args.seed,
+        )
     else:
         print(
             "[2B Step 1] Note: Pass --ref-h5ad /path/to/gbmap_or_neftel.h5ad to prepare reference_sc.h5ad "

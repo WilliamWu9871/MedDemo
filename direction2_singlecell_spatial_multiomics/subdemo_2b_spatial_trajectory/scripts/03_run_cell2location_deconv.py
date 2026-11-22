@@ -121,9 +121,10 @@ def main() -> None:
         detection_alpha=float(c2l_cfg["detection_alpha"]),
     )
     sp_epochs = 150 if args.synthetic else int(c2l_cfg["spatial_max_epochs"])
+    sp_batch_size = None if (use_gpu and adata_vis_sub.n_obs <= 10000) else min(int(c2l_cfg["spatial_batch_size"]), adata_vis_sub.n_obs)
     mod_vis.train(
         max_epochs=sp_epochs,
-        batch_size=min(int(c2l_cfg["spatial_batch_size"]), adata_vis_sub.n_obs),
+        batch_size=sp_batch_size,
         train_size=1.0,
         accelerator=accelerator,
     )
