@@ -49,13 +49,18 @@ if [[ -z "${KERNEL_NAME}" ]] && command -v jupyter >/dev/null 2>&1; then
   fi
 fi
 
+if [[ -n "${KERNEL_NAME}" ]]; then
+  python "${DIR2_ROOT}/scripts/patch_kernelspec.py" "${KERNEL_NAME}" || true
+fi
+
 if [[ "${CLEAN_CHECKPOINTS}" == "true" ]]; then
   echo "[2A Step 3] Cleaning existing phase1/phase2 checkpoints under ${SUB2A_ROOT}/outputs/scdori/..."
   rm -rf "${SUB2A_ROOT}/outputs/scdori/phase1" "${SUB2A_ROOT}/outputs/scdori/phase2"
 fi
 
 OUT_NB_DIR="${SUB2A_ROOT}/outputs/scdori/executed_notebooks"
-mkdir -p "${OUT_NB_DIR}"
+ISOLATED_IPYTHONDIR="${OUT_NB_DIR}/.ipython"
+mkdir -p "${OUT_NB_DIR}" "${ISOLATED_IPYTHONDIR}"
 
 run_nb() {
   local nb_name="$1"
@@ -68,7 +73,8 @@ run_nb() {
   echo "[2A Step 3] Executing ${in_nb} with SCDORI_CONFIG_FILE=${CONFIG_JSON} (kernel=${KERNEL_NAME:-default})..."
   (
     cd "${SUB2A_ROOT}"
-    SCDORI_CONFIG_FILE="${CONFIG_JSON}" papermill "${in_nb}" "${out_nb}" "${kernel_args[@]}"
+    IPYTHONDIR="${ISOLATED_IPYTHONDIR}" SCDORI_CONFIG_FILE="${CONFIG_JSON}" \
+      papermill "${in_nb}" "${out_nb}" --log-output "${kernel_args[@]}"
   )
 }
 

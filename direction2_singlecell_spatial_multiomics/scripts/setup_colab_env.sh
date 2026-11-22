@@ -27,6 +27,7 @@ uv pip install --python "${VENV_DIR}/bin/python" \
   huggingface_hub requests pyyaml tqdm matplotlib seaborn Pillow
 
 python -m ipykernel install --user --name meddemo_dir2_py311 --display-name "Python 3.11 (meddemo_dir2)"
+python "${DIR2_ROOT}/scripts/patch_kernelspec.py" meddemo_dir2_py311
 bash "${DIR2_ROOT}/scripts/setup_repos.sh"
 
 python -c "import sys, numpy, torch, anndata, scanpy, muon, squidpy, scvi, cell2location, scdori, decoupler; print('OK | Python:', sys.version.split()[0], '| NumPy:', numpy.__version__, '| PyTorch:', torch.__version__, '| CUDA:', torch.cuda.is_available(), '| scDoRI:', scdori.__file__)"

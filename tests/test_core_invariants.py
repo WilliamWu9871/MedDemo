@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -167,6 +168,37 @@ class TestDirection2HelpersAndConfigs(unittest.TestCase):
         ]
         self.assertEqual(mod.extract_topic_tfs(syn_tfs, 2, top_n=2), ["PAX5", "EBF1"])
         self.assertEqual(mod.extract_topic_genes(syn_genes, 2, top_n=2), ["CD19", "MS4A1"])
+
+    def test_patch_kernel_json(self) -> None:
+        mod = _load_module(
+            "patch_ks",
+            REPO_ROOT / "direction2_singlecell_spatial_multiomics/scripts/patch_kernelspec.py",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            kj = Path(tmp) / "kernel.json"
+            kj.write_text(
+                json.dumps(
+                    {
+                        "argv": [
+                            "/content/venv_meddemo_dir2_py311/bin/python",
+                            "-m",
+                            "ipykernel_launcher",
+                            "-f",
+                            "{connection_file}",
+                        ],
+                        "display_name": "Python 3.11 (meddemo_dir2)",
+                        "language": "python",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertTrue(mod.patch_kernel_json(kj))
+            patched = json.loads(kj.read_text(encoding="utf-8"))
+            self.assertEqual(patched["argv"][0], "/content/venv_meddemo_dir2_py311/bin/python")
+            self.assertEqual(patched["argv"][1], "-c")
+            self.assertIn("SYSTEM_CONFIG_DIRS", patched["argv"][2])
+            self.assertEqual(patched["argv"][3:], ["-f", "{connection_file}"])
+            self.assertFalse(mod.patch_kernel_json(kj))
 
 
 if __name__ == "__main__":
