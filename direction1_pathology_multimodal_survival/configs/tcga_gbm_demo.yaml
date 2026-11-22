@@ -5,6 +5,7 @@ experiment:
   n_patients: 70
   slide_type: Diagnostic Slide
   min_os_days: 1
+  max_slide_mb: 800
 
 paths:
   wsi_dir: data/tcga_gbm/svs

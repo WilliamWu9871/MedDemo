@@ -8,10 +8,13 @@ are strictly excluded per computational pathology best practice.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +28,7 @@ from direction1.utils import extract_tcga_patient_id, load_yaml_config, resolve_
 
 GDC_FILES_ENDPOINT = "https://api.gdc.cancer.gov/files"
 GDC_DATA_ENDPOINT = "https://api.gdc.cancer.gov/data"
+AWS_TCGA_S3_BASE = "https://tcga-2-open.s3.amazonaws.com"
 
 
 def _parse_stage_numeric(stage_str: Any) -> float:
@@ -47,6 +51,7 @@ def query_gdc_diagnostic_slides(
     n_patients: int,
     min_os_days: int = 1,
     seed: int = 42,
+    max_slide_mb: float | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Query GDC API for Open Access SVS Diagnostic Slides and matched OS clinical fields."""
     import requests
@@ -159,6 +164,18 @@ def query_gdc_diagnostic_slides(
     if full_df["age"].isna().any():
         full_df["age"] = full_df["age"].fillna(full_df["age"].median())
 
+    if max_slide_mb is not None and max_slide_mb > 0:
+        max_bytes = int(max_slide_mb * 1_000_000)
+        sized_df = full_df[full_df["file_size"] <= max_bytes].copy()
+        n_sized_pats = sized_df["patient_id"].nunique()
+        if n_sized_pats >= n_patients:
+            full_df = sized_df
+        else:
+            print(
+                f"[Stage 0][WARN] Only {n_sized_pats} patients have slides <= {max_slide_mb:.0f} MB "
+                f"(< requested {n_patients}); keeping all slides to satisfy patient count."
+            )
+
     # Patient-level stratified selection
     rng = np.random.default_rng(seed)
     patient_df = full_df.groupby("patient_id", as_index=False).first()[["patient_id", "os_event"]]
@@ -186,15 +203,90 @@ def query_gdc_diagnostic_slides(
     return selected_df, manifest_df
 
 
+def _download_single_slide(
+    file_id: str,
+    filename: str,
+    expected_size: int,
+    wsi_dir: Path,
+    session: Any,
+    source: str,
+) -> tuple[str, int, int, str, float]:
+    """Download a single SVS file with HTTP Range resume and S3->GDC fallback."""
+    import requests
+
+    dest = wsi_dir / filename
+    tmp = dest.with_suffix(".part")
+    s3_url = f"{AWS_TCGA_S3_BASE}/{file_id}/{filename}"
+    gdc_url = f"{GDC_DATA_ENDPOINT}/{file_id}"
+    if source == "s3":
+        candidates = [("s3", s3_url)]
+    elif source == "gdc":
+        candidates = [("gdc", gdc_url)]
+    else:
+        candidates = [("s3", s3_url), ("gdc", gdc_url)]
+
+    last_err: Exception | None = None
+    for label, url in candidates:
+        for attempt in range(1, 4):
+            try:
+                existing = tmp.stat().st_size if tmp.exists() else 0
+                if expected_size > 0 and existing > expected_size:
+                    tmp.unlink(missing_ok=True)
+                    existing = 0
+
+                if expected_size > 0 and existing == expected_size:
+                    tmp.rename(dest)
+                    return filename, expected_size, 0, label, 0.0
+
+                headers = {"Range": f"bytes={existing}-"} if existing > 0 else {}
+                t0 = time.monotonic()
+                with session.get(url, headers=headers, stream=True, timeout=(15, 120)) as resp:
+                    if resp.status_code == 416:
+                        if expected_size > 0 and existing == expected_size:
+                            tmp.rename(dest)
+                            return filename, expected_size, 0, label, 0.0
+                        tmp.unlink(missing_ok=True)
+                        continue
+                    if resp.status_code == 404:
+                        last_err = requests.HTTPError(f"404 Not Found at {url}", response=resp)
+                        break
+                    resp.raise_for_status()
+
+                    mode = "ab" if (existing > 0 and resp.status_code == 206) else "wb"
+                    downloaded = 0
+                    with tmp.open(mode) as handle:
+                        for chunk in resp.iter_content(chunk_size=4 * 1024 * 1024):
+                            if chunk:
+                                handle.write(chunk)
+                                downloaded += len(chunk)
+
+                actual_size = tmp.stat().st_size
+                if expected_size > 0 and actual_size != expected_size:
+                    raise OSError(
+                        f"Size mismatch for {filename}: got {actual_size} bytes, expected {expected_size}"
+                    )
+                tmp.rename(dest)
+                dt = max(time.monotonic() - t0, 1e-6)
+                return filename, actual_size, downloaded, label, (downloaded / 1e6) / dt
+            except (requests.RequestException, OSError) as exc:
+                last_err = exc
+                if attempt < 3:
+                    time.sleep(1.5 * attempt)
+
+    raise RuntimeError(f"{filename}: {last_err}")
+
+
 def download_gdc_files(
     manifest_df: pd.DataFrame,
     wsi_dir: Path,
     use_gdc_client: bool = False,
     manifest_path: Path | None = None,
+    workers: int = 8,
+    source: str = "auto",
 ) -> None:
-    """Download SVS files using gdc-client or resumable HTTP streaming."""
+    """Download SVS files using gdc-client or concurrent resumable S3/GDC streaming."""
     import requests
-    from tqdm import tqdm
+    from requests.adapters import HTTPAdapter
 
     wsi_dir.mkdir(parents=True, exist_ok=True)
     if use_gdc_client and shutil.which("gdc-client") and manifest_path is not None:
@@ -203,23 +295,91 @@ def download_gdc_files(
         subprocess.run(cmd, check=True)
         return
 
+    # Remove orphaned .part files that no longer belong to the active manifest
+    expected_parts = {(wsi_dir / str(name)).with_suffix(".part").name for name in manifest_df["filename"]}
+    for part_path in wsi_dir.glob("*.part"):
+        if part_path.name not in expected_parts:
+            part_path.unlink(missing_ok=True)
+
+    pending_rows = []
+    done_files = 0
+    done_bytes = 0
+    total_files = len(manifest_df)
+    total_bytes = int(manifest_df["size"].sum())
+
     for row in manifest_df.itertuples(index=False):
         dest = wsi_dir / row.filename
-        if dest.exists() and dest.stat().st_size == int(row.size):
-            continue
-        url = f"{GDC_DATA_ENDPOINT}/{row.id}"
-        print(f"[download] Streaming {row.filename} ({row.size / 1e6:.1f} MB)...")
-        with requests.get(url, stream=True, timeout=120) as resp:
-            resp.raise_for_status()
-            tmp = dest.with_suffix(".part")
-            with tmp.open("wb") as handle, tqdm(
-                total=int(row.size), unit="B", unit_scale=True, desc=row.filename
-            ) as pbar:
-                for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        handle.write(chunk)
-                        pbar.update(len(chunk))
-            tmp.rename(dest)
+        expected_size = int(row.size)
+        if dest.exists() and (expected_size <= 0 or dest.stat().st_size == expected_size):
+            done_files += 1
+            done_bytes += expected_size
+        else:
+            pending_rows.append(row)
+
+    if not pending_rows:
+        print(f"[download] All {total_files} slides ({total_bytes / (1024**3):.2f} GB) already present.")
+        return
+
+    remaining_gb = sum(int(r.size) for r in pending_rows) / (1024**3)
+    n_workers = max(1, int(workers))
+    print(
+        f"[download] {done_files}/{total_files} already present; downloading {len(pending_rows)} slides "
+        f"({remaining_gb:.2f} GB) with workers={n_workers}, source={source}..."
+    )
+
+    pool_size = max(n_workers * 2, 16)
+    session = requests.Session()
+    adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    lock = threading.Lock()
+    t_start = time.monotonic()
+    transferred_total = 0
+    failures: list[str] = []
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
+            future_to_name = {
+                executor.submit(
+                    _download_single_slide,
+                    str(row.id),
+                    str(row.filename),
+                    int(row.size),
+                    wsi_dir,
+                    session,
+                    source,
+                ): str(row.filename)
+                for row in pending_rows
+            }
+            for future in concurrent.futures.as_completed(future_to_name):
+                fname = future_to_name[future]
+                try:
+                    name, actual_size, transferred, used_source, file_mb_s = future.result()
+                    with lock:
+                        done_files += 1
+                        done_bytes += actual_size
+                        transferred_total += transferred
+                        elapsed = max(time.monotonic() - t_start, 1e-6)
+                        agg_mb_s = (transferred_total / 1e6) / elapsed
+                        print(
+                            f"[download][{done_files}/{total_files}] {name} "
+                            f"({actual_size / 1e6:.1f} MB via {used_source} @ {file_mb_s:.1f} MB/s) | "
+                            f"Total: {done_bytes / (1024**3):.2f}/{total_bytes / (1024**3):.2f} GB "
+                            f"(avg {agg_mb_s:.1f} MB/s)",
+                            flush=True,
+                        )
+                except Exception as exc:
+                    with lock:
+                        failures.append(str(exc))
+                        print(f"[download][ERROR] {fname}: {exc}", file=sys.stderr, flush=True)
+    finally:
+        session.close()
+
+    if failures:
+        raise RuntimeError(
+            f"Failed to download {len(failures)}/{len(pending_rows)} slides:\n  - " + "\n  - ".join(failures[:10])
+        )
 
 
 def generate_synthetic_cohort(
@@ -354,6 +514,19 @@ def main() -> None:
     parser.add_argument("--n-patients", type=int, default=None, help="Override patient count")
     parser.add_argument("--download", action="store_true", help="Download SVS files in addition to manifest/clinical")
     parser.add_argument("--use-gdc-client", action="store_true", help="Prefer gdc-client CLI over HTTP streaming")
+    parser.add_argument("--workers", type=int, default=8, help="Concurrent file download workers (default: 8)")
+    parser.add_argument(
+        "--source",
+        choices=["auto", "s3", "gdc"],
+        default="auto",
+        help="Download mirror: auto (AWS S3 tcga-2-open -> GDC fallback), s3, or gdc",
+    )
+    parser.add_argument(
+        "--max-slide-mb",
+        type=float,
+        default=None,
+        help="Optional max SVS size in MB (0 disables config cap)",
+    )
     parser.add_argument("--synthetic", action="store_true", help="Generate synthetic dry-run cohort instead of GDC query")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -373,6 +546,12 @@ def main() -> None:
 
     project_id = cfg["experiment"]["project"]
     min_os_days = int(cfg["experiment"].get("min_os_days", 1))
+    cfg_max_mb = cfg["experiment"].get("max_slide_mb")
+    if args.max_slide_mb is not None:
+        max_slide_mb = None if args.max_slide_mb <= 0 else float(args.max_slide_mb)
+    else:
+        max_slide_mb = float(cfg_max_mb) if cfg_max_mb else None
+
     meta_dir = resolve_path(DIR1_ROOT, cfg["paths"]["metadata_dir"])
     wsi_dir = resolve_path(DIR1_ROOT, cfg["paths"]["wsi_dir"])
     clinical_path = resolve_path(DIR1_ROOT, cfg["paths"]["clinical_csv"])
@@ -383,6 +562,7 @@ def main() -> None:
         n_patients=n_patients,
         min_os_days=min_os_days,
         seed=args.seed,
+        max_slide_mb=max_slide_mb,
     )
     manifest_path = meta_dir / "gdc_manifest.tsv"
     manifest_df.to_csv(manifest_path, sep="\t", index=False)
@@ -402,6 +582,8 @@ def main() -> None:
             wsi_dir=wsi_dir,
             use_gdc_client=args.use_gdc_client,
             manifest_path=manifest_path,
+            workers=args.workers,
+            source=args.source,
         )
     else:
         print("  Pass --download to fetch SVS files, or run: gdc-client download -m", manifest_path, "-d", wsi_dir)
