@@ -24,6 +24,7 @@ dependencies:
       - muon
       - squidpy
       - scvi-tools
+      - pyro-ppl>=1.8.0,<1.9.2
       - cell2location
       - torch>=2.1
       - scikit-learn>=1.2
