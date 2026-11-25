@@ -101,10 +101,14 @@ class TokenGuidedMultimodalSurv(nn.Module):
         n_heads: int = 4,
         n_bins: int = 4,
         dropout: float = 0.25,
+        use_tsr: bool = True,
         use_clinical: bool = True,
     ):
         super().__init__()
+        self.use_tsr = bool(use_tsr and tsr_dim > 0)
         self.use_clinical = bool(use_clinical and clinical_dim > 0)
+        if not self.use_tsr and not self.use_clinical:
+            raise ValueError("TokenGuidedMultimodalSurv requires at least one of use_tsr or use_clinical")
         self.hidden_dim = hidden_dim
 
         self.patch_proj = nn.Sequential(
@@ -115,14 +119,18 @@ class TokenGuidedMultimodalSurv(nn.Module):
         )
         self.wsi_pool = GatedAttentionPool(hidden_dim=hidden_dim, attn_dim=hidden_dim // 2, dropout=dropout)
 
-        self.tsr_encoder = nn.Sequential(
-            nn.Linear(tsr_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-        )
+        if self.use_tsr:
+            self.tsr_encoder = nn.Sequential(
+                nn.Linear(tsr_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+            )
+        else:
+            self.tsr_encoder = None
+
         if self.use_clinical:
             self.clinical_encoder = nn.Sequential(
                 nn.Linear(clinical_dim, hidden_dim),
@@ -138,7 +146,8 @@ class TokenGuidedMultimodalSurv(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
         nn.init.trunc_normal_(self.cls_token, std=0.02)
 
-        num_modal_tokens = 4 if self.use_clinical else 3  # CLS, WSI_pool, TSR_cross, [Clin_cross]
+        n_prior_tokens = int(self.use_tsr) + int(self.use_clinical)
+        num_modal_tokens = 2 + n_prior_tokens  # CLS, WSI_pool, [TSR_cross], [Clin_cross]
         self.modality_embed = nn.Parameter(torch.zeros(1, num_modal_tokens, hidden_dim))
         nn.init.trunc_normal_(self.modality_embed, std=0.02)
 
@@ -163,8 +172,8 @@ class TokenGuidedMultimodalSurv(nn.Module):
             encoder_layer, num_layers=1, enable_nested_tensor=False
         )
 
-        # Residual concat of fused CLS + pooled WSI + TSR prior token
-        head_in_dim = hidden_dim * 3
+        # Residual concat of fused CLS + pooled WSI + enabled prior token(s)
+        head_in_dim = hidden_dim * (2 + n_prior_tokens)
         self.classifier = nn.Sequential(
             nn.LayerNorm(head_in_dim),
             nn.Linear(head_in_dim, hidden_dim),
@@ -176,25 +185,31 @@ class TokenGuidedMultimodalSurv(nn.Module):
     def forward(
         self,
         features: torch.Tensor,
-        tsr_vec: torch.Tensor,
+        tsr_vec: torch.Tensor | None = None,
         clinical_vec: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if features.ndim == 2:
             features = features.unsqueeze(0)
-        if tsr_vec.ndim == 1:
-            tsr_vec = tsr_vec.unsqueeze(0)
 
         wsi_tokens = self.patch_proj(features)  # (1, M, D)
         wsi_pooled, wsi_attn_weights = self.wsi_pool(wsi_tokens)  # (1, D), (M,)
 
-        tsr_token = self.tsr_encoder(tsr_vec).unsqueeze(1)  # (1, 1, D)
-        prior_queries = [tsr_token]
+        prior_queries: list[torch.Tensor] = []
+        if self.use_tsr:
+            if tsr_vec is None:
+                raise ValueError("tsr_vec must be provided when use_tsr=True")
+            if tsr_vec.ndim == 1:
+                tsr_vec = tsr_vec.unsqueeze(0)
+            assert self.tsr_encoder is not None
+            tsr_token = self.tsr_encoder(tsr_vec).unsqueeze(1)  # (1, 1, D)
+            prior_queries.append(tsr_token)
 
         if self.use_clinical:
             if clinical_vec is None:
                 raise ValueError("clinical_vec must be provided when use_clinical=True")
             if clinical_vec.ndim == 1:
                 clinical_vec = clinical_vec.unsqueeze(0)
+            assert self.clinical_encoder is not None
             clin_token = self.clinical_encoder(clinical_vec).unsqueeze(1)  # (1, 1, D)
             prior_queries.append(clin_token)
 
@@ -207,8 +222,8 @@ class TokenGuidedMultimodalSurv(nn.Module):
             average_attn_weights=True,
         )
         cross_tokens = self.cross_norm(query_seq + cross_out)  # (1, K, D)
-        # TSR-steered patch attention (query 0 = TSR semantic anchor)
-        tsr_patch_attn = cross_weights[0, 0, :]  # (M,)
+        # Prior-steered patch attention (query 0: TSR anchor when enabled, else Clinical anchor)
+        prior_patch_attn = cross_weights[0, 0, :]  # (M,)
 
         fusion_seq = torch.cat(
             [self.cls_token, wsi_pooled.unsqueeze(1), cross_tokens],
@@ -218,7 +233,7 @@ class TokenGuidedMultimodalSurv(nn.Module):
         fused = self.fusion_transformer(fusion_seq)
         cls_repr = fused[:, 0, :]
 
-        joint_repr = torch.cat([cls_repr, wsi_pooled, tsr_token.squeeze(1)], dim=-1)
+        joint_repr = torch.cat([cls_repr, wsi_pooled] + [q.squeeze(1) for q in prior_queries], dim=-1)
         logits = self.classifier(joint_repr)
         hazards, survival, risk = hazards_to_survival_and_risk(logits)
         return {
@@ -226,6 +241,6 @@ class TokenGuidedMultimodalSurv(nn.Module):
             "hazards": hazards,
             "survival": survival,
             "risk": risk,
-            "attn_weights": tsr_patch_attn,
+            "attn_weights": prior_patch_attn,
             "wsi_attn_weights": wsi_attn_weights,
         }

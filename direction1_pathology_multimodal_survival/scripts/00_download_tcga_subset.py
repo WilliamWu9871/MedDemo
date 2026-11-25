@@ -77,6 +77,7 @@ def query_gdc_diagnostic_slides(
             "cases.demographic.days_to_death",
             "cases.demographic.age_at_index",
             "cases.demographic.gender",
+            "cases.demographic.sex_at_birth",
             "cases.diagnoses.days_to_last_follow_up",
             "cases.diagnoses.ajcc_pathologic_stage",
             "cases.samples.sample_type",
@@ -132,8 +133,14 @@ def query_gdc_diagnostic_slides(
 
         age_val = demo.get("age_at_index")
         age = float(age_val) if age_val is not None else np.nan
-        gender = str(demo.get("gender") or "unknown").strip().lower()
-        sex = 1.0 if gender == "male" else 0.0
+        raw_sex = str(demo.get("sex_at_birth") or demo.get("gender") or "unknown").strip().lower()
+        if raw_sex == "male":
+            sex = 1.0
+        elif raw_sex == "female":
+            sex = 0.0
+        else:
+            sex = np.nan
+        gender = raw_sex
         stage_raw = str(diag.get("ajcc_pathologic_stage") or "Stage I")
         stage = _parse_stage_numeric(stage_raw)
 
@@ -163,6 +170,12 @@ def query_gdc_diagnostic_slides(
     # Impute missing ages with median
     if full_df["age"].isna().any():
         full_df["age"] = full_df["age"].fillna(full_df["age"].median())
+
+    # Impute missing sex with observed cohort mode (default 1.0 only if all missing)
+    if full_df["sex"].isna().any():
+        valid_sex = full_df["sex"].dropna()
+        fill_sex = float(valid_sex.mode().iloc[0]) if not valid_sex.empty else 1.0
+        full_df["sex"] = full_df["sex"].fillna(fill_sex)
 
     if max_slide_mb is not None and max_slide_mb > 0:
         max_bytes = int(max_slide_mb * 1_000_000)

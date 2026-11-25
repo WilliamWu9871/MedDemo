@@ -4,6 +4,7 @@ from direction1.utils import (
     assert_no_patient_leakage,
     encode_tsr_bins,
     extract_tcga_patient_id,
+    infer_patch_step_lv0,
     load_yaml_config,
 )
 
@@ -11,6 +12,7 @@ __all__ = [
     "extract_tcga_patient_id",
     "encode_tsr_bins",
     "assert_no_patient_leakage",
+    "infer_patch_step_lv0",
     "load_yaml_config",
     "NLLSurvLoss",
     "fit_survival_bins",

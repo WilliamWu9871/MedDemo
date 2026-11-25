@@ -89,3 +89,40 @@ def resolve_path(base_dir: str | Path, path_value: str | Path) -> Path:
     """Resolve a relative path against base_dir, keeping absolute paths unchanged."""
     p = Path(path_value)
     return p if p.is_absolute() else (Path(base_dir) / p).resolve()
+
+
+def infer_patch_step_lv0(coords: Iterable[Any], default_step: int = 448) -> int:
+    """Infer level-0 patch stride from grid coordinates (handles 20x/40x & 224/256px)."""
+    pts = [(int(round(float(p[0]))), int(round(float(p[1])))) for p in coords]
+    if len(pts) < 2:
+        return int(default_step)
+
+    by_y: dict[int, list[int]] = {}
+    by_x: dict[int, list[int]] = {}
+    for x, y in pts:
+        by_y.setdefault(y, []).append(x)
+        by_x.setdefault(x, []).append(y)
+
+    deltas: list[int] = []
+    for xs in by_y.values():
+        if len(xs) > 1:
+            s = sorted(set(xs))
+            deltas.extend(s[i + 1] - s[i] for i in range(len(s) - 1) if (s[i + 1] - s[i]) > 0)
+    for ys in by_x.values():
+        if len(ys) > 1:
+            s = sorted(set(ys))
+            deltas.extend(s[i + 1] - s[i] for i in range(len(s) - 1) if (s[i + 1] - s[i]) > 0)
+
+    if not deltas:
+        xs = sorted({x for x, _ in pts})
+        ys = sorted({y for _, y in pts})
+        deltas.extend(xs[i + 1] - xs[i] for i in range(len(xs) - 1) if (xs[i + 1] - xs[i]) > 0)
+        deltas.extend(ys[i + 1] - ys[i] for i in range(len(ys) - 1) if (ys[i + 1] - ys[i]) > 0)
+
+    if not deltas:
+        return int(default_step)
+
+    deltas.sort()
+    q20_idx = max(0, int(0.20 * (len(deltas) - 1)))
+    step = deltas[q20_idx]
+    return int(step) if step >= 32 else int(default_step)

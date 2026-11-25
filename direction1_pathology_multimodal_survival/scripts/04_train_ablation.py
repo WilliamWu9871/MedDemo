@@ -91,6 +91,9 @@ def _run_cox_fold(
 
     tr_c = _safe_cindex(tr_df["os_time"].to_numpy(), tr_risk, tr_df["os_event"].to_numpy())
     va_c = _safe_cindex(va_df["os_time"].to_numpy(), va_risk, va_df["os_event"].to_numpy())
+    tr_mu = float(np.mean(tr_risk))
+    tr_sd = float(np.std(tr_risk))
+    tr_sd = tr_sd if tr_sd > 1e-8 else 1.0
 
     metric_row = {
         "seed": seed,
@@ -98,6 +101,8 @@ def _run_cox_fold(
         "exp_name": exp_name,
         "train_cindex": tr_c,
         "val_cindex": va_c,
+        "train_loss": float("nan"),
+        "val_loss": float("nan"),
         "n_train_patients": len(tr_df),
         "n_val_patients": len(va_df),
     }
@@ -107,6 +112,7 @@ def _run_cox_fold(
     oof_df["fold"] = fold
     oof_df["exp_name"] = exp_name
     oof_df["risk_score"] = va_risk
+    oof_df["risk_score_z"] = (va_risk - tr_mu) / tr_sd
     return metric_row, oof_df
 
 
@@ -118,10 +124,11 @@ def _evaluate_mil(
     model: torch.nn.Module,
     dataset: PatientMILDataset,
     device: torch.device,
-) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, list[dict[str, Any]]]:
+    criterion: NLLSurvLoss | None = None,
+) -> tuple[float, float, np.ndarray, np.ndarray, np.ndarray, list[dict[str, Any]]]:
     model.eval()
     loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=_mil_collate_single)
-    times, events, risks = [], [], []
+    times, events, risks, losses = [], [], [], []
     slide_attns: list[dict[str, Any]] = []
 
     with torch.no_grad():
@@ -130,6 +137,10 @@ def _evaluate_mil(
             tsr_vec = item["tsr_vec"].to(device)
             clin_vec = item["clinical_vec"].to(device)
             out = model(feats, tsr_vec=tsr_vec, clinical_vec=clin_vec)
+            if criterion is not None:
+                y_disc = item["y_disc"].to(device).view(1)
+                censorship = item["censorship"].to(device).view(1)
+                losses.append(float(criterion(out["logits"], y_disc, censorship).item()))
             risk_val = float(out["risk"].item())
             times.append(item["os_time"])
             events.append(item["os_event"])
@@ -161,7 +172,8 @@ def _evaluate_mil(
     t_arr = np.asarray(times, dtype=np.float64)
     e_arr = np.asarray(events, dtype=np.int64)
     r_arr = np.asarray(risks, dtype=np.float64)
-    return _safe_cindex(t_arr, r_arr, e_arr), t_arr, r_arr, e_arr, slide_attns
+    mean_loss = float(np.mean(losses)) if losses else float("nan")
+    return _safe_cindex(t_arr, r_arr, e_arr), mean_loss, t_arr, r_arr, e_arr, slide_attns
 
 
 def _build_dl_model(
@@ -179,6 +191,18 @@ def _build_dl_model(
 
     if exp_name == "exp1_1_wsi_abmil":
         return GatedABMIL(in_dim=in_dim, hidden_dim=hidden_dim, n_bins=n_bins, dropout=dropout)
+    if exp_name == "exp1_1b_wsi_clinical_token":
+        return TokenGuidedMultimodalSurv(
+            in_dim=in_dim,
+            tsr_dim=tsr_dim,
+            clinical_dim=clinical_dim,
+            hidden_dim=hidden_dim,
+            n_heads=n_heads,
+            n_bins=n_bins,
+            dropout=dropout,
+            use_tsr=False,
+            use_clinical=True,
+        )
     if exp_name == "exp1_2a_wsi_tsr_token":
         return TokenGuidedMultimodalSurv(
             in_dim=in_dim,
@@ -188,6 +212,7 @@ def _build_dl_model(
             n_heads=n_heads,
             n_bins=n_bins,
             dropout=dropout,
+            use_tsr=True,
             use_clinical=False,
         )
     if exp_name == "exp1_2b_wsi_tsr_clinical_token":
@@ -199,6 +224,7 @@ def _build_dl_model(
             n_heads=n_heads,
             n_bins=n_bins,
             dropout=dropout,
+            use_tsr=True,
             use_clinical=True,
         )
     raise ValueError(f"Unknown DL experiment: {exp_name}")
@@ -216,7 +242,7 @@ def _run_dl_fold(
     epochs_override: int | None,
     device: torch.device,
     attention_dir: Path,
-) -> tuple[dict[str, Any], pd.DataFrame]:
+) -> tuple[dict[str, Any], pd.DataFrame, list[dict[str, Any]]]:
     t_cfg = cfg["training"]
     epochs = int(epochs_override or t_cfg.get("epochs", 25))
     grad_accum = int(t_cfg.get("grad_accum_steps", 16))
@@ -238,14 +264,16 @@ def _run_dl_fold(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
     train_loader = DataLoader(train_ds, batch_size=1, shuffle=True, collate_fn=_mil_collate_single)
 
-    best_val_c = -1.0
+    best_val_loss = float("inf")
     best_state = copy.deepcopy(model.state_dict())
     no_improve = 0
+    epoch_rows: list[dict[str, Any]] = []
 
     for epoch in range(epochs):
         model.train()
         optimizer.zero_grad(set_to_none=True)
         step_in_accum = 0
+        epoch_losses: list[float] = []
 
         for idx, item in enumerate(train_loader):
             feats = item["features"].to(device)
@@ -256,6 +284,7 @@ def _run_dl_fold(
 
             out = model(feats, tsr_vec=tsr_vec, clinical_vec=clin_vec)
             loss = criterion(out["logits"], y_disc, censorship)
+            epoch_losses.append(float(loss.item()))
             (loss / grad_accum).backward()
             step_in_accum += 1
 
@@ -266,9 +295,21 @@ def _run_dl_fold(
                 step_in_accum = 0
 
         scheduler.step()
-        val_c, _, _, _, _ = _evaluate_mil(model, val_ds, device)
-        if not np.isnan(val_c) and val_c > best_val_c:
-            best_val_c = val_c
+        train_loss_ep = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
+        val_c, val_loss_ep, _, _, _, _ = _evaluate_mil(model, val_ds, device, criterion=criterion)
+        epoch_rows.append(
+            {
+                "seed": seed,
+                "fold": fold,
+                "exp_name": exp_name,
+                "epoch": epoch + 1,
+                "train_loss": train_loss_ep,
+                "val_loss": val_loss_ep,
+                "val_cindex": val_c,
+            }
+        )
+        if not np.isnan(val_loss_ep) and val_loss_ep < best_val_loss - 1e-4:
+            best_val_loss = val_loss_ep
             best_state = copy.deepcopy(model.state_dict())
             no_improve = 0
         else:
@@ -277,8 +318,11 @@ def _run_dl_fold(
                 break
 
     model.load_state_dict(best_state)
-    tr_c, _, _, _, _ = _evaluate_mil(model, train_ds, device)
-    va_c, _, va_risks, _, val_slide_attns = _evaluate_mil(model, val_ds, device)
+    tr_c, tr_loss, _, tr_risks, _, _ = _evaluate_mil(model, train_ds, device, criterion=criterion)
+    va_c, va_loss, _, va_risks, _, val_slide_attns = _evaluate_mil(model, val_ds, device, criterion=criterion)
+    tr_mu = float(np.mean(tr_risks))
+    tr_sd = float(np.std(tr_risks))
+    tr_sd = tr_sd if tr_sd > 1e-8 else 1.0
 
     exp_attn_dir = attention_dir / f"seed_{seed}" / exp_name
     exp_attn_dir.mkdir(parents=True, exist_ok=True)
@@ -297,6 +341,8 @@ def _run_dl_fold(
         "exp_name": exp_name,
         "train_cindex": tr_c,
         "val_cindex": va_c,
+        "train_loss": tr_loss,
+        "val_loss": va_loss,
         "n_train_patients": len(train_ds),
         "n_val_patients": len(val_ds),
     }
@@ -308,7 +354,8 @@ def _run_dl_fold(
     oof_df["fold"] = fold
     oof_df["exp_name"] = exp_name
     oof_df["risk_score"] = oof_df["patient_id"].map(risk_by_pat)
-    return metric_row, oof_df
+    oof_df["risk_score_z"] = (oof_df["risk_score"] - tr_mu) / tr_sd
+    return metric_row, oof_df, epoch_rows
 
 
 def main() -> None:
@@ -413,9 +460,11 @@ def main() -> None:
 
     all_metrics: list[dict[str, Any]] = []
     all_oofs: list[pd.DataFrame] = []
+    all_epochs: list[dict[str, Any]] = []
 
     dl_exps = [
         "exp1_1_wsi_abmil",
+        "exp1_1b_wsi_clinical_token",
         "exp1_2a_wsi_tsr_token",
         "exp1_2b_wsi_tsr_clinical_token",
     ]
@@ -508,7 +557,7 @@ def main() -> None:
             )
 
             for exp_name in dl_exps:
-                m_dl, oof_dl = _run_dl_fold(
+                m_dl, oof_dl, ep_dl = _run_dl_fold(
                     exp_name=exp_name,
                     train_ds=train_ds,
                     val_ds=val_ds,
@@ -523,12 +572,13 @@ def main() -> None:
                 )
                 all_metrics.append(m_dl)
                 all_oofs.append(oof_dl)
+                all_epochs.extend(ep_dl)
 
             print(
                 f"  [seed={seed} fold={fold}] "
                 + " | ".join(
                     f"{row['exp_name'].split('_', 2)[-1]}={row['val_cindex']:.3f}"
-                    for row in all_metrics[-5:]
+                    for row in all_metrics[-(2 + len(dl_exps)) :]
                 ),
                 flush=True,
             )
@@ -537,6 +587,8 @@ def main() -> None:
     oofs_df = pd.concat(all_oofs, ignore_index=True)
     metrics_df.to_csv(out_dir / "fold_metrics.csv", index=False)
     oofs_df.to_csv(out_dir / "oof_predictions.csv", index=False)
+    if all_epochs:
+        pd.DataFrame(all_epochs).to_csv(out_dir / "epoch_history.csv", index=False)
 
     summary = metrics_df.groupby("exp_name")[["train_cindex", "val_cindex"]].agg(["mean", "std"]).round(4)
     print(f"\n[Stage 3B] Saved results -> {out_dir}")

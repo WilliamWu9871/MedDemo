@@ -51,25 +51,21 @@ def build_patient_splits(
         raise ValueError(f"Need at least {n_splits} unique patients for {n_splits}-fold CV, got {len(unique_patients)}")
 
     for seed in seeds:
-        rng = np.random.default_rng(seed)
-        shuffled_patients = unique_patients.copy()
-        rng.shuffle(shuffled_patients)
-        patient_order = {pid: rank for rank, pid in enumerate(shuffled_patients)}
-
-        # Sort deterministically by shuffled patient rank so each seed produces distinct folds
-        ordered = out.assign(_order=out["patient_id"].map(patient_order)).sort_values(["_order", "slide_id"])
-        sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=False)
-
-        fold_assign = pd.Series(index=ordered.index, dtype=np.int64)
+        sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=int(seed))
+        fold_assign = pd.Series(index=out.index, dtype=np.int64)
         for fold_idx, (train_pos, val_pos) in enumerate(
-            sgkf.split(ordered, ordered["os_event"].to_numpy(), groups=ordered["patient_id"].to_numpy())
+            sgkf.split(out, out["os_event"].to_numpy(), groups=out["patient_id"].to_numpy())
         ):
-            train_pids = ordered.iloc[train_pos]["patient_id"]
-            val_pids = ordered.iloc[val_pos]["patient_id"]
+            train_pids = out.iloc[train_pos]["patient_id"]
+            val_pids = out.iloc[val_pos]["patient_id"]
             assert_no_patient_leakage(train_pids, val_pids, context=f"seed={seed}, fold={fold_idx}")
             fold_assign.iloc[val_pos] = fold_idx
+        out[f"seed_{seed}_fold"] = fold_assign.astype(int)
 
-        out[f"seed_{seed}_fold"] = fold_assign.reindex(out.index).astype(int)
+    if len(seeds) >= 2 and len(unique_patients) >= n_splits * 2:
+        c0, c1 = f"seed_{seeds[0]}_fold", f"seed_{seeds[1]}_fold"
+        if (out[c0] == out[c1]).all():
+            raise RuntimeError(f"Seeds {seeds[0]} and {seeds[1]} produced identical fold assignments!")
 
     return out
 

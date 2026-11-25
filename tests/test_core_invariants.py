@@ -17,6 +17,7 @@ from direction1.utils import (
     assert_no_patient_leakage,
     encode_tsr_bins,
     extract_tcga_patient_id,
+    infer_patch_step_lv0,
 )
 
 
@@ -69,6 +70,21 @@ class TestDirection1Utils(unittest.TestCase):
                 context="fold_0",
             )
         self.assertIn("TCGA-01-0002", str(ctx.exception))
+
+    def test_infer_patch_step_lv0(self) -> None:
+        self.assertEqual(
+            infer_patch_step_lv0([(0, 0), (224, 0), (448, 0), (0, 224)]),
+            224,
+        )
+        self.assertEqual(
+            infer_patch_step_lv0([(0, 0), (448, 0), (1344, 0), (0, 448), (448, 448)]),
+            448,
+        )
+        self.assertEqual(
+            infer_patch_step_lv0([(0, 0), (512, 0), (0, 512)]),
+            512,
+        )
+        self.assertEqual(infer_patch_step_lv0([(100, 200)], default_step=448), 448)
 
 
 class TestDirection2HelpersAndConfigs(unittest.TestCase):

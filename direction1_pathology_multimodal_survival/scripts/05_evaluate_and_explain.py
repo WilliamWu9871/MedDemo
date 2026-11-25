@@ -29,18 +29,29 @@ from sklearn.linear_model import Ridge
 DIR1_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(DIR1_ROOT / "src"))
 
-from direction1.utils import load_yaml_config, resolve_path
+from direction1.utils import infer_patch_step_lv0, load_yaml_config, resolve_path
 
 EXP_DISPLAY = {
     "exp1_0_clinical_cox": "Exp 1.0 Clinical CoxPH",
     "exp1_0b_clinical_tsr_cox": "Exp 1.0b Clinical+TSR CoxPH",
     "exp1_1_wsi_abmil": "Exp 1.1 WSI-only ABMIL",
+    "exp1_1b_wsi_clinical_token": "Exp 1.1b WSI+Clinical Token",
     "exp1_2a_wsi_tsr_token": "Exp 1.2a WSI+TSR Token",
     "exp1_2b_wsi_tsr_clinical_token": "Exp 1.2b WSI+TSR+Clinical Token",
 }
 
 
-def _compute_ipcw_auc(oof_df: pd.DataFrame, horizon_days: float = 1095.0) -> float:
+def _select_risk_col(df: pd.DataFrame) -> str:
+    if "risk_score_z" in df.columns and df["risk_score_z"].notna().all():
+        return "risk_score_z"
+    return "risk_score"
+
+
+def _compute_ipcw_auc(
+    oof_df: pd.DataFrame,
+    risk_col: str = "risk_score",
+    horizon_days: float = 1095.0,
+) -> float:
     try:
         from sksurv.metrics import cumulative_dynamic_auc
         from sksurv.util import Surv
@@ -60,7 +71,7 @@ def _compute_ipcw_auc(oof_df: pd.DataFrame, horizon_days: float = 1095.0) -> flo
         aucs, _ = cumulative_dynamic_auc(
             y_struct,
             y_struct,
-            oof_df["risk_score"].to_numpy(dtype=np.float64),
+            oof_df[risk_col].to_numpy(dtype=np.float64),
             times=np.asarray([eval_t]),
         )
         return float(aucs[0])
@@ -69,18 +80,19 @@ def _compute_ipcw_auc(oof_df: pd.DataFrame, horizon_days: float = 1095.0) -> flo
 
 
 def build_cindex_report(fold_df: pd.DataFrame, oof_df: pd.DataFrame, report_dir: Path) -> pd.DataFrame:
+    risk_col = _select_risk_col(oof_df)
     rows: list[dict[str, Any]] = []
     for exp_name, grp in fold_df.groupby("exp_name", sort=False):
         oof_sub = oof_df[oof_df["exp_name"] == exp_name]
         # Aggregate per patient across seeds if multiple seeds exist
         pat_oof = oof_sub.groupby("patient_id", as_index=False).agg(
-            {"os_time": "first", "os_event": "first", "risk_score": "mean"}
+            {"os_time": "first", "os_event": "first", risk_col: "mean"}
         )
         try:
             pooled_c = float(
                 concordance_index(
                     pat_oof["os_time"],
-                    -pat_oof["risk_score"],
+                    -pat_oof[risk_col],
                     event_observed=pat_oof["os_event"],
                 )
             )
@@ -89,7 +101,12 @@ def build_cindex_report(fold_df: pd.DataFrame, oof_df: pd.DataFrame, report_dir:
         tr_mean = float(grp["train_cindex"].mean())
         va_mean = float(grp["val_cindex"].mean())
         va_std = float(grp["val_cindex"].std(ddof=1)) if len(grp) > 1 else 0.0
-        auc_3y = _compute_ipcw_auc(pat_oof, horizon_days=1095.0)
+        va_loss_mean = (
+            float(grp["val_loss"].mean())
+            if "val_loss" in grp.columns and grp["val_loss"].notna().any()
+            else float("nan")
+        )
+        auc_3y = _compute_ipcw_auc(pat_oof, risk_col=risk_col, horizon_days=1095.0)
         leakage_flag = bool(tr_mean > 0.92 and va_mean < 0.55)
         rows.append(
             {
@@ -98,6 +115,7 @@ def build_cindex_report(fold_df: pd.DataFrame, oof_df: pd.DataFrame, report_dir:
                 "train_cindex_mean": round(tr_mean, 4),
                 "val_cindex_mean": round(va_mean, 4),
                 "val_cindex_std": round(va_std, 4),
+                "val_loss_mean": round(va_loss_mean, 4) if not np.isnan(va_loss_mean) else np.nan,
                 "pooled_oof_cindex": round(pooled_c, 4),
                 "ipcw_auc_3yr": round(auc_3y, 4) if not np.isnan(auc_3y) else np.nan,
                 "leakage_red_line": leakage_flag,
@@ -108,16 +126,17 @@ def build_cindex_report(fold_df: pd.DataFrame, oof_df: pd.DataFrame, report_dir:
     table.to_csv(report_dir / "ablation_cindex_table.csv", index=False)
 
     md_lines = [
-        "| Model | Train C-index | Val C-index (mean ± std) | Pooled OOF C-index | 3-Yr IPCW AUC | Red-Line |",
-        "| --- | ---: | ---: | ---: | ---: | --- |",
+        "| Model | Train C-index | Val C-index (mean ± std) | Val NLL Loss | Pooled OOF C-index | 3-Yr IPCW AUC | Red-Line |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for r in rows:
+        loss_str = f"{r['val_loss_mean']:.3f}" if pd.notna(r["val_loss_mean"]) else "N/A"
         auc_str = f"{r['ipcw_auc_3yr']:.3f}" if pd.notna(r["ipcw_auc_3yr"]) else "N/A"
         flag_str = "RED-LINE: OVERFIT/LEAK" if r["leakage_red_line"] else "OK"
         md_lines.append(
             f"| {r['label']} | {r['train_cindex_mean']:.3f} | "
             f"{r['val_cindex_mean']:.3f} ± {r['val_cindex_std']:.3f} | "
-            f"{r['pooled_oof_cindex']:.3f} | {auc_str} | {flag_str} |"
+            f"{loss_str} | {r['pooled_oof_cindex']:.3f} | {auc_str} | {flag_str} |"
         )
     (report_dir / "ablation_cindex_table.md").write_text("\n".join(md_lines) + "\n", encoding="utf-8")
 
@@ -130,7 +149,52 @@ def build_cindex_report(fold_df: pd.DataFrame, oof_df: pd.DataFrame, report_dir:
     return table
 
 
+def plot_loss_curves(ablation_dir: Path, report_dir: Path) -> None:
+    """Plot mean ± SD train/val NLLSurvLoss curves across folds and seeds for DL models."""
+    epoch_path = ablation_dir / "epoch_history.csv"
+    if not epoch_path.exists():
+        return
+    epoch_df = pd.read_csv(epoch_path)
+    if epoch_df.empty:
+        return
+
+    exps = [e for e in EXP_DISPLAY if e in set(epoch_df["exp_name"])]
+    if not exps:
+        return
+    n_panels = len(exps)
+    fig, axes = plt.subplots(1, n_panels, figsize=(4.4 * n_panels, 3.8), sharey=True)
+    if n_panels == 1:
+        axes = [axes]
+
+    for ax, exp_name in zip(axes, exps):
+        sub = epoch_df[epoch_df["exp_name"] == exp_name]
+        agg = sub.groupby("epoch", as_index=False).agg(
+            tr_mean=("train_loss", "mean"),
+            tr_std=("train_loss", "std"),
+            va_mean=("val_loss", "mean"),
+            va_std=("val_loss", "std"),
+        )
+        agg["tr_std"] = agg["tr_std"].fillna(0.0)
+        agg["va_std"] = agg["va_std"].fillna(0.0)
+        ep = agg["epoch"].to_numpy()
+        ax.plot(ep, agg["tr_mean"], color="#1f77b4", lw=1.8, label="Train NLL")
+        ax.fill_between(ep, agg["tr_mean"] - agg["tr_std"], agg["tr_mean"] + agg["tr_std"], color="#1f77b4", alpha=0.16)
+        ax.plot(ep, agg["va_mean"], color="#d62728", lw=1.8, label="Val NLL")
+        ax.fill_between(ep, agg["va_mean"] - agg["va_std"], agg["va_mean"] + agg["va_std"], color="#d62728", alpha=0.16)
+        ax.set_title(EXP_DISPLAY.get(exp_name, exp_name), fontsize=10)
+        ax.set_xlabel("Epoch")
+        if ax is axes[0]:
+            ax.set_ylabel("NLLSurvLoss")
+        ax.legend(loc="upper right", fontsize=8)
+        ax.grid(alpha=0.25)
+
+    fig.tight_layout()
+    fig.savefig(report_dir / "loss_curves.png", dpi=200)
+    plt.close(fig)
+
+
 def plot_km_curves(oof_df: pd.DataFrame, report_dir: Path) -> None:
+    risk_col = _select_risk_col(oof_df)
     exps = [e for e in EXP_DISPLAY if e in set(oof_df["exp_name"])]
     n_panels = len(exps)
     fig, axes = plt.subplots(1, n_panels, figsize=(4.5 * n_panels, 4.2), sharey=True)
@@ -141,13 +205,12 @@ def plot_km_curves(oof_df: pd.DataFrame, report_dir: Path) -> None:
         sub = (
             oof_df[oof_df["exp_name"] == exp_name]
             .groupby("patient_id", as_index=False)
-            .agg({"os_time": "first", "os_event": "first", "risk_score": "mean"})
+            .agg({"os_time": "first", "os_event": "first", risk_col: "mean"})
         )
-        med = float(sub["risk_score"].median())
-        high = sub[sub["risk_score"] > med]
-        low = sub[sub["risk_score"] <= med]
+        med = float(sub[risk_col].median())
+        high = sub[sub[risk_col] > med]
+        low = sub[sub[risk_col] <= med]
         if high.empty or low.empty:
-            med = float(sub["risk_score"].quantile(0.5))
             high = sub.iloc[: len(sub) // 2]
             low = sub.iloc[len(sub) // 2 :]
 
@@ -179,6 +242,7 @@ def run_multivariable_cox(
     target_exp: str,
     report_dir: Path,
 ) -> pd.DataFrame:
+    risk_col = _select_risk_col(oof_df)
     sub = oof_df[oof_df["exp_name"] == target_exp]
     if sub.empty:
         sub = oof_df[oof_df["exp_name"] == oof_df["exp_name"].iloc[0]]
@@ -187,14 +251,14 @@ def run_multivariable_cox(
         {
             "os_time": "first",
             "os_event": "first",
-            "risk_score": "mean",
+            risk_col: "mean",
             "pTSR": "mean",
             **{c: "first" for c in clinical_cols},
         }
     )
     cox_df = pd.DataFrame(
         {
-            "AI_Risk_Score_Z": (pat["risk_score"] - pat["risk_score"].mean()) / (pat["risk_score"].std() + 1e-8),
+            "AI_Risk_Score_Z": (pat[risk_col] - pat[risk_col].mean()) / (pat[risk_col].std() + 1e-8),
             "os_time": pat["os_time"],
             "os_event": pat["os_event"],
         }
@@ -296,16 +360,17 @@ def plot_shap_summary(
     report_dir: Path,
 ) -> None:
     """Compute SHAP feature contributions for [pTSR + clinical covariates] explaining AI Risk Score."""
+    risk_col = _select_risk_col(oof_df)
     sub = oof_df[oof_df["exp_name"] == target_exp]
     if sub.empty:
         return
     pat = sub.groupby("patient_id", as_index=False).agg(
-        {"risk_score": "mean", "pTSR": "mean", **{c: "first" for c in clinical_cols}}
+        {risk_col: "mean", "pTSR": "mean", **{c: "first" for c in clinical_cols}}
     )
     feat_cols = ["pTSR"] + clinical_cols
     X = pat[feat_cols].copy()
     X = (X - X.mean()) / (X.std() + 1e-8)
-    y = pat["risk_score"].to_numpy(dtype=np.float64)
+    y = pat[risk_col].to_numpy(dtype=np.float64)
 
     surrogate = Ridge(alpha=1.0).fit(X, y)
     try:
@@ -422,8 +487,9 @@ def render_attention_heatmaps(
 
             heat = np.zeros((th_h, th_w), dtype=np.float32)
             counts = np.zeros((th_h, th_w), dtype=np.float32)
-            tile_w = max(int(round(256 * scale_x)), 4)
-            tile_h = max(int(round(256 * scale_y)), 4)
+            step_lv0 = infer_patch_step_lv0(coords, default_step=448)
+            tile_w = max(int(round(step_lv0 * scale_x)), 2)
+            tile_h = max(int(round(step_lv0 * scale_y)), 2)
 
             bg_top_hits = 0
             top_k = max(1, int(np.ceil(0.10 * len(w_norm))))
@@ -499,11 +565,13 @@ def main() -> None:
 
     clinical_cols = list(cfg["data"]["clinical_cols"])
     default_seed = int(args.seed or fold_df["seed"].iloc[0])
-    target_exp = "exp1_2b_wsi_tsr_clinical_token"
+    cox_exp = "exp1_2a_wsi_tsr_token"
+    shap_exp = "exp1_2b_wsi_tsr_clinical_token"
 
     cindex_table = build_cindex_report(fold_df, oof_df, report_dir)
+    plot_loss_curves(ablation_dir, report_dir)
     plot_km_curves(oof_df, report_dir)
-    mv_cox = run_multivariable_cox(oof_df, clinical_cols, target_exp, report_dir)
+    mv_cox = run_multivariable_cox(oof_df, clinical_cols, cox_exp, report_dir)
 
     eval_cfg = cfg.get("evaluation", {})
     plot_rcs_tsr_curve(
@@ -511,7 +579,7 @@ def main() -> None:
         knots_pct=list(eval_cfg.get("rcs_knots_percentiles", [5, 35, 65, 95])),
         report_dir=report_dir,
     )
-    plot_shap_summary(oof_df, clinical_cols, target_exp, report_dir)
+    plot_shap_summary(oof_df, clinical_cols, shap_exp, report_dir)
     render_attention_heatmaps(
         oof_df=oof_df,
         priors_df=priors_df,

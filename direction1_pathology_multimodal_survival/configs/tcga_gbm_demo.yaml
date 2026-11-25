@@ -20,10 +20,10 @@ paths:
   thumbnails_dir: data/tcga_gbm/thumbnails
 
 trident:
-  patch_encoder: uni_v1
+  patch_encoder: hibou_l
   fallback_encoder: resnet50
   mag: 20
-  patch_size: 256
+  patch_size: 224
   remove_artifacts: true
   remove_penmarks: true
   batch_size: 64
@@ -34,7 +34,9 @@ splits:
   default_seed: 42
 
 prior:
-  backend: color_heuristic   # color_heuristic | tiatoolbox
+  backend: kather_probe        # kather_probe | color_heuristic | tiatoolbox
+  kather_dataset: DykeF/NCTCRCHE100K
+  max_samples_per_class: 400
   tsr_num_bins: 8
 
 data:
