@@ -118,7 +118,7 @@ def train_or_load_kather_probe(
     encoder_name: str,
     dataset_repo: str = "DykeF/NCTCRCHE100K",
     max_per_class: int = 400,
-    batch_size: int = 128,
+    batch_size: int = 256,
     seed: int = 42,
 ) -> dict[str, Any]:
     """Train or load a 9-class Kather-100K linear probe on top of TRIDENT patch embeddings."""
@@ -178,10 +178,15 @@ def train_or_load_kather_probe(
         sampled_indices.extend(int(i) for i in idxs)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     encoder = encoder_factory(encoder_name).to(device)
     encoder.eval()
     transforms = encoder.eval_transforms
     precision = getattr(encoder, "precision", torch.float32)
+    if device.type == "cuda" and precision == torch.float32:
+        precision = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     use_amp = device.type == "cuda" and precision in (torch.float16, torch.bfloat16)
 
     feats_chunks: list[np.ndarray] = []

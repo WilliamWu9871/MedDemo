@@ -26,7 +26,7 @@ trident:
   patch_size: 224
   remove_artifacts: true
   remove_penmarks: true
-  batch_size: 64
+  batch_size: 256
 
 splits:
   n_splits: 5

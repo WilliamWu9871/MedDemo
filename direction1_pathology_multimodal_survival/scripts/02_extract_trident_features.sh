@@ -15,6 +15,7 @@ SLIDE_ENCODER="${SLIDE_ENCODER:-}"
 MAG="${MAG:-20}"
 PATCH_SIZE="${PATCH_SIZE:-224}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
+FEAT_BATCH_SIZE="${FEAT_BATCH_SIZE:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -25,9 +26,10 @@ while [[ $# -gt 0 ]]; do
     --mag) MAG="$2"; shift 2 ;;
     --patch-size) PATCH_SIZE="$2"; shift 2 ;;
     --batch-size) BATCH_SIZE="$2"; shift 2 ;;
+    --feat-batch-size) FEAT_BATCH_SIZE="$2"; shift 2 ;;
     *)
       echo "Unknown argument: $1" >&2
-      echo "Usage: $0 [--wsi-dir DIR] [--job-dir DIR] [--patch-encoder hibou_l|conch_v15|uni_v1|ctranspath|resnet50] [--slide-encoder titan] [--mag 20] [--patch-size 224]" >&2
+      echo "Usage: $0 [--wsi-dir DIR] [--job-dir DIR] [--patch-encoder hibou_l|conch_v15|uni_v1|ctranspath|resnet50] [--slide-encoder titan] [--mag 20] [--patch-size 224] [--feat-batch-size 256]" >&2
       exit 1
       ;;
   esac
@@ -47,7 +49,7 @@ fi
 mkdir -p "${JOB_DIR}"
 
 CMD=(
-  python "${TRIDENT_DIR}/run_batch_of_slides.py"
+  python "${SCRIPT_DIR}/run_trident_fast.py"
   --task all
   --wsi_dir "${WSI_DIR}"
   --job_dir "${JOB_DIR}"
@@ -58,7 +60,13 @@ CMD=(
   --remove_artifacts
   --remove_penmarks
   --skip_errors
+  --clear_dead_locks
+  --dead_lock_max_age_hours 0.01
 )
+
+if [[ -n "${FEAT_BATCH_SIZE}" ]]; then
+  CMD+=(--feat_batch_size "${FEAT_BATCH_SIZE}")
+fi
 
 if [[ -n "${SLIDE_ENCODER}" ]]; then
   CMD+=(--slide_encoder "${SLIDE_ENCODER}")
